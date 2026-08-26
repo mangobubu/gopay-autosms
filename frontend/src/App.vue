@@ -54,6 +54,12 @@ const form = reactive({
 })
 
 const proxyInputCount = computed(() => form.proxy.split(/\r?\n/).map((item) => item.trim()).filter(Boolean).length)
+const proxyPlaceholder = [
+  'hostname:port:username:password',
+  'socks5://username:password@host:port',
+  'username:password@hostname:port',
+  'hostname:port@username:password',
+].join('\n')
 
 const rules: FormRules = {
   service: [{ required: true, message: '请选择服务', trigger: 'change' }],
@@ -546,7 +552,7 @@ onBeforeUnmount(() => {
                 type="textarea"
                 :rows="5"
                 resize="vertical"
-                placeholder="hostname:port:username:password\nsocks5://username:password@host:port\nusername:password@hostname:port\nhostname:port@username:password"
+                :placeholder="proxyPlaceholder"
               />
               <div class="field-hint">
                 支持 HTTP/HTTPS 与 SOCKS5；未写协议默认 HTTP。已使用或预检失败的地址会移出池，多号码并发不会重复分配。
