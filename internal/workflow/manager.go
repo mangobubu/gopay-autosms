@@ -198,8 +198,15 @@ func (m *Manager) claimProxy(ctx context.Context, batch domain.Batch) (string, e
 		choice = available[int(binary.BigEndian.Uint64(raw[:])%uint64(len(available)))]
 	}
 	selectedURL := decodedURLs[choice]
-	options.ProxyPool[choice].Status = "used"
-	options.ProxyPool[choice].Error = ""
+	// A repeated input line remains visible in the total count, but represents
+	// the same endpoint. Once that endpoint is claimed, retire every duplicate
+	// slot so it can never be assigned to a second number later.
+	for index := range options.ProxyPool {
+		if decodedURLs[index] == selectedURL {
+			options.ProxyPool[index].Status = "used"
+			options.ProxyPool[index].Error = ""
+		}
+	}
 	updated, err := json.Marshal(options)
 	if err != nil {
 		return "", err
