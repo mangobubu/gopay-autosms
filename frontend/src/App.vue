@@ -4,10 +4,17 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
 
 import { api, ApiError } from './api'
+import { matchesCatalogOption } from './catalogSearch'
 import ActivationCard from './components/ActivationCard.vue'
+import {
+  findAccountLoginStatusByPhone,
+  indexAccountLoginStatusesByPhone,
+} from './loginStatus'
+import { findRefreshedPrice } from './priceOptions'
 import {
   activationStatus,
   batchStatus,
+  normalizeAccountLoginStatuses,
   normalizeActivations,
   normalizeBatch,
   normalizeCountries,
@@ -19,11 +26,18 @@ import type {
   ActivationView,
   BatchView,
   CatalogOption,
+  GoPayLoginStatusView,
   PriceOption,
+  PriceTier,
   SMSBowerSettings,
 } from './types'
 
 const POLL_INTERVAL_MS = 2_000
+// The server's default login-status cache is four seconds, so each normal
+// five-second browser poll can start a fresh remote probe without a boundary hit.
+const LOGIN_STATUS_POLL_INTERVAL_MS = 5_000
+const LOGIN_STATUS_REQUEST_TIMEOUT_MS = 20_000
+const CLOCK_INTERVAL_MS = 1_000
 const ACTIVE_BATCH_KEY = 'gopay-autosms.active-batch'
 
 const settings = reactive<SMSBowerSettings>({
@@ -42,6 +56,7 @@ const prices = ref<PriceOption[]>([])
 const servicesLoading = ref(false)
 const countriesLoading = ref(false)
 const pricesLoading = ref(false)
+const countryQuery = ref('')
 
 const batchFormRef = ref<FormInstance>()
 const form = reactive({
@@ -91,11 +106,25 @@ const currentBatch = ref<BatchView | null>(null)
 const currentBatchId = ref(localStorage.getItem(ACTIVE_BATCH_KEY) ?? '')
 const activations = ref<ActivationView[]>([])
 const actionBusy = reactive<Record<string, boolean>>({})
+const countdownNow = ref(Date.now())
+const accountLoginStatuses = ref<GoPayLoginStatusView[]>([])
+const loginStatusRefreshing = ref(false)
 let pollTimer: number | undefined
+let loginStatusPollTimer: number | undefined
+let clockTimer: number | undefined
+let loginStatusAbortController: AbortController | undefined
+let disposed = false
+let priceRequestVersion = 0
 
 const selectedPrice = computed(() => prices.value.find((item) => item.key === form.priceKey))
 const selectedService = computed(() => services.value.find((item) => item.value === form.service))
 const selectedCountry = computed(() => countries.value.find((item) => item.value === form.country))
+const filteredCountries = computed(() => countries.value.filter(
+  (item) => matchesCatalogOption(item, countryQuery.value),
+))
+const accountLoginStatusesByPhone = computed(() => (
+  indexAccountLoginStatusesByPhone(accountLoginStatuses.value)
+))
 const currentBatchMeta = computed(() => batchStatus(currentBatch.value?.status ?? 'pending'))
 const activeActivationCount = computed(
   () => activations.value.filter((item) => !item.finishedAt && activationStatus(item.status).active).length,
@@ -129,6 +158,88 @@ function friendlyError(error: unknown): string {
 
 function sanitizePin(value: string): void {
   form.pin = value.replace(/\D/g, '').slice(0, 6)
+}
+
+function filterCountries(query: string): void {
+  countryQuery.value = query
+}
+
+function resetCountryQuery(): void {
+  countryQuery.value = ''
+}
+
+function handleCountryDropdownVisible(visible: boolean): void {
+  if (!visible) resetCountryQuery()
+}
+
+function priceOptionLabel(item: PriceOption): string {
+  return item.label
+}
+
+function priceOptionDetails(item: PriceOption): string {
+  if (!item.tier) return item.label
+  const tierPart = ` · ${item.tier}`
+  return item.label.replace(tierPart, '')
+}
+
+function priceTierClass(tier: PriceTier): string {
+  return `price-tier--${tier.toLowerCase()}`
+}
+
+function resetPrices(): void {
+  priceRequestVersion += 1
+  pricesLoading.value = false
+  form.priceKey = ''
+  prices.value = []
+}
+
+async function loadPrices(options: {
+  preserveSelection?: boolean
+  notifySuccess?: boolean
+} = {}): Promise<void> {
+  const service = form.service
+  const country = form.country
+  if (!service || !country) return
+
+  const previousSelection = options.preserveSelection ? selectedPrice.value : undefined
+  const hadSelection = Boolean(form.priceKey)
+  const requestVersion = ++priceRequestVersion
+  pricesLoading.value = true
+  try {
+    const nextPrices = normalizePrices(await api.getPrices(service, country))
+    if (
+      requestVersion !== priceRequestVersion
+      || service !== form.service
+      || country !== form.country
+    ) return
+
+    prices.value = nextPrices
+    if (options.preserveSelection && previousSelection) {
+      const refreshedSelection = findRefreshedPrice(previousSelection, nextPrices)
+      if (refreshedSelection) {
+        form.priceKey = refreshedSelection.key
+      } else {
+        form.priceKey = ''
+        ElMessage.warning('原报价已失效，请重新选择价格和供应商')
+      }
+    } else if (options.preserveSelection && hadSelection) {
+      form.priceKey = ''
+      ElMessage.warning('原报价已失效，请重新选择价格和供应商')
+    }
+
+    connectionError.value = ''
+    if (options.notifySuccess) {
+      ElMessage.success(`价格已刷新，共 ${nextPrices.length} 个报价`)
+    }
+  } catch (error) {
+    if (requestVersion === priceRequestVersion) ElMessage.error(friendlyError(error))
+  } finally {
+    if (requestVersion === priceRequestVersion) pricesLoading.value = false
+  }
+}
+
+async function refreshPrices(): Promise<void> {
+  await loadPrices({ preserveSelection: true, notifySuccess: true })
 }
 
 async function loadSettings(): Promise<void> {
@@ -178,10 +289,10 @@ async function loadServices(): Promise<void> {
 }
 
 async function handleServiceChange(): Promise<void> {
+  countryQuery.value = ''
   form.country = ''
-  form.priceKey = ''
   countries.value = []
-  prices.value = []
+  resetPrices()
   if (!form.service) return
 
   countriesLoading.value = true
@@ -196,22 +307,16 @@ async function handleServiceChange(): Promise<void> {
 }
 
 async function handleCountryChange(): Promise<void> {
-  form.priceKey = ''
-  prices.value = []
+  resetPrices()
   if (!form.service || !form.country) return
-
-  pricesLoading.value = true
-  try {
-    prices.value = normalizePrices(await api.getPrices(form.service, form.country))
-    connectionError.value = ''
-  } catch (error) {
-    ElMessage.error(friendlyError(error))
-  } finally {
-    pricesLoading.value = false
-  }
+  await loadPrices()
 }
 
 async function startBatch(): Promise<void> {
+  if (pricesLoading.value) {
+    ElMessage.warning('价格正在刷新，请稍候')
+    return
+  }
   const valid = await batchFormRef.value?.validate().catch(() => false)
   if (!valid) return
   const offer = selectedPrice.value
@@ -308,9 +413,54 @@ async function refreshDashboard(silent = true): Promise<void> {
   }
 }
 
+function loginStatusForActivation(activation: ActivationView): GoPayLoginStatusView | undefined {
+  return findAccountLoginStatusByPhone(accountLoginStatusesByPhone.value, activation.phone)
+}
+
+async function refreshAccountLoginStatuses(): Promise<void> {
+  if (disposed || loginStatusRefreshing.value) return
+  loginStatusRefreshing.value = true
+  const controller = new AbortController()
+  loginStatusAbortController = controller
+  const timeoutTimer = window.setTimeout(() => {
+    controller.abort()
+  }, LOGIN_STATUS_REQUEST_TIMEOUT_MS)
+  try {
+    const payload = await api.getAccountLoginStatuses(controller.signal)
+    if (disposed || controller.signal.aborted || loginStatusAbortController !== controller) return
+    const nextStatuses = normalizeAccountLoginStatuses(payload)
+    accountLoginStatuses.value = nextStatuses
+  } catch {
+    // Keep the last successful result visible; the next five-second poll retries automatically.
+  } finally {
+    window.clearTimeout(timeoutTimer)
+    const isCurrentRequest = loginStatusAbortController === controller
+    if (isCurrentRequest) loginStatusAbortController = undefined
+    if (!disposed && isCurrentRequest) {
+      loginStatusRefreshing.value = false
+    }
+  }
+}
+
 function startPolling(): void {
-  if (pollTimer !== undefined) return
+  if (disposed || pollTimer !== undefined) return
   pollTimer = window.setInterval(() => void refreshDashboard(true), POLL_INTERVAL_MS)
+}
+
+function startLoginStatusPolling(): void {
+  if (disposed || loginStatusPollTimer !== undefined) return
+  loginStatusPollTimer = window.setInterval(
+    () => void refreshAccountLoginStatuses(),
+    LOGIN_STATUS_POLL_INTERVAL_MS,
+  )
+}
+
+function startClock(): void {
+  if (clockTimer !== undefined) return
+  countdownNow.value = Date.now()
+  clockTimer = window.setInterval(() => {
+    countdownNow.value = Date.now()
+  }, CLOCK_INTERVAL_MS)
 }
 
 async function markSuccess(activation: ActivationView): Promise<void> {
@@ -354,13 +504,31 @@ async function deleteActivation(activation: ActivationView): Promise<void> {
 }
 
 onMounted(async () => {
-  await Promise.all([loadSettings(), refreshDashboard(true)])
+  disposed = false
+  startClock()
+  startLoginStatusPolling()
+  await Promise.all([
+    loadSettings(),
+    refreshDashboard(true),
+    refreshAccountLoginStatuses(),
+  ])
+  if (disposed) return
   if (settingsReady.value) await loadServices()
+  if (disposed) return
   startPolling()
 })
 
 onBeforeUnmount(() => {
+  disposed = true
+  loginStatusAbortController?.abort()
+  loginStatusAbortController = undefined
+  loginStatusRefreshing.value = false
   if (pollTimer !== undefined) window.clearInterval(pollTimer)
+  if (loginStatusPollTimer !== undefined) window.clearInterval(loginStatusPollTimer)
+  if (clockTimer !== undefined) window.clearInterval(clockTimer)
+  pollTimer = undefined
+  loginStatusPollTimer = undefined
+  clockTimer = undefined
 })
 </script>
 
@@ -496,13 +664,17 @@ onBeforeUnmount(() => {
                   v-model="form.country"
                   filterable
                   clearable
+                  :filter-method="filterCountries"
                   :loading="countriesLoading"
                   :disabled="!form.service"
-                  placeholder="选择国家"
+                  placeholder="输入国家或代码（如 US）"
                   @change="handleCountryChange"
+                  @clear="resetCountryQuery"
+                  @keydown.esc.capture="resetCountryQuery"
+                  @visible-change="handleCountryDropdownVisible"
                 >
                   <el-option
-                    v-for="item in countries"
+                    v-for="item in filteredCountries"
                     :key="item.key"
                     :label="item.label"
                     :value="item.value"
@@ -510,22 +682,55 @@ onBeforeUnmount(() => {
                 </el-select>
               </el-form-item>
               <el-form-item label="价格 / 供应商" prop="priceKey">
-                <el-select
-                  v-model="form.priceKey"
-                  filterable
-                  clearable
-                  :loading="pricesLoading"
-                  :disabled="!form.country"
-                  placeholder="选择价格"
-                >
-                  <el-option
-                    v-for="item in prices"
-                    :key="item.key"
-                    :label="item.label"
-                    :value="item.key"
-                    :disabled="item.stock === 0"
-                  />
-                </el-select>
+                <div class="price-field-content">
+                  <div class="price-picker">
+                    <el-select
+                      v-model="form.priceKey"
+                      filterable
+                      clearable
+                      :loading="pricesLoading"
+                      :disabled="!form.country || pricesLoading"
+                      placeholder="选择价格"
+                    >
+                      <el-option
+                        v-for="item in prices"
+                        :key="item.key"
+                        :label="priceOptionLabel(item)"
+                        :value="item.key"
+                        :disabled="item.stock === 0 || item.price === undefined"
+                      >
+                        <div class="price-option">
+                          <span class="price-option__label">{{ priceOptionDetails(item) }}</span>
+                          <span
+                            v-if="item.tier"
+                            class="price-tier"
+                            :class="priceTierClass(item.tier)"
+                          >
+                            {{ item.tier }}
+                          </span>
+                        </div>
+                      </el-option>
+                    </el-select>
+                    <el-button
+                      class="price-refresh-button"
+                      native-type="button"
+                      plain
+                      aria-label="刷新价格"
+                      title="重新获取当前服务和国家的价格"
+                      :loading="pricesLoading"
+                      :disabled="!form.country || pricesLoading"
+                      @click="refreshPrices"
+                    >
+                      刷新价格
+                    </el-button>
+                  </div>
+                  <div class="price-tier-legend" aria-label="供应商等级说明">
+                    <span>价格从低到高 · 等级由数据源提供</span>
+                    <span class="price-tier price-tier--bronze">Bronze</span>
+                    <span class="price-tier price-tier--silver">Silver</span>
+                    <span class="price-tier price-tier--gold">Gold</span>
+                  </div>
+                </div>
               </el-form-item>
             </div>
 
@@ -564,6 +769,13 @@ onBeforeUnmount(() => {
               <div class="selection-summary">
                 <span>预计单价</span>
                 <strong>{{ selectedPrice?.price === undefined ? '—' : `${selectedPrice.price} ₽` }}</strong>
+                <span
+                  v-if="selectedPrice?.tier"
+                  class="price-tier"
+                  :class="priceTierClass(selectedPrice.tier)"
+                >
+                  {{ selectedPrice.tier }}
+                </span>
               </div>
               <el-button
                 class="start-button"
@@ -571,7 +783,7 @@ onBeforeUnmount(() => {
                 size="large"
                 native-type="submit"
                 :loading="starting"
-                :disabled="!settingsReady"
+                :disabled="!settingsReady || pricesLoading"
               >
                 启动批次
               </el-button>
@@ -644,7 +856,9 @@ onBeforeUnmount(() => {
             v-for="activation in activations"
             :key="activation.id"
             :activation="activation"
+            :login-status="loginStatusForActivation(activation)"
             :busy="actionBusy[activation.id]"
+            :now-ms="countdownNow"
             @success="markSuccess"
             @delete="deleteActivation"
           />

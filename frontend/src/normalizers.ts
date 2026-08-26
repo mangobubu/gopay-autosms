@@ -2,7 +2,10 @@ import type {
   ActivationView,
   BatchView,
   CatalogOption,
+  GoPayLoginState,
+  GoPayLoginStatusView,
   PriceOption,
+  PriceTier,
   SMSBowerSettings,
   StatusMeta,
   UnknownRecord,
@@ -35,11 +38,85 @@ function asNumber(value: unknown, fallback = 0): number {
   return fallback
 }
 
+function asOptionalNumber(value: unknown): number | undefined {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim().replace(',', '.').replace(/[\s₽$€£]/g, '')
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(normalized)) return undefined
+  const parsed = Number.parseFloat(normalized)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+function numericPriceTier(value: unknown): PriceTier | undefined {
+  const text = asText(value).trim()
+  if (typeof value !== 'number' && !/^[1-3]$/.test(text)) return undefined
+  const numeric = typeof value === 'number' ? value : Number.parseInt(text, 10)
+  if (numeric === 1) return 'Gold'
+  if (numeric === 2) return 'Silver'
+  if (numeric === 3) return 'Bronze'
+  return undefined
+}
+
+function asPriceTier(value: unknown): PriceTier | undefined {
+  const normalized = asText(value).trim().toLowerCase().replace(/[^a-z0-9]/g, '')
+  if (['bronze', 'bronzetier', 'bronzerank'].includes(normalized)) return 'Bronze'
+  if (['silver', 'silvertier', 'silverrank'].includes(normalized)) return 'Silver'
+  if (['gold', 'goldtier', 'goldrank'].includes(normalized)) return 'Gold'
+  if (isRecord(value)) {
+    for (const key of ['description', 'name', 'tier', 'rank', 'level', 'grade', 'quality']) {
+      const nested = asPriceTier(value[key])
+      if (nested) return nested
+    }
+    return numericPriceTier(pick(value, ['id', 'value', 'code']))
+  }
+  return numericPriceTier(value)
+}
+
+const PRICE_TIER_KEYS = [
+  'tier',
+  'rank',
+  'level',
+  'grade',
+  'quality',
+  'providerTier',
+  'provider_tier',
+  'providerRank',
+  'provider_rank',
+  'providerLevel',
+  'provider_level',
+  'providerGrade',
+  'provider_grade',
+  'providerQuality',
+  'provider_quality',
+] as const
+
+function priceTierFromRecord(record: UnknownRecord): PriceTier | undefined {
+  for (const key of PRICE_TIER_KEYS) {
+    const tier = asPriceTier(record[key])
+    if (tier) return tier
+  }
+  return undefined
+}
+
 function asBoolean(value: unknown): boolean {
   if (typeof value === 'boolean') return value
   if (typeof value === 'number') return value !== 0
   if (typeof value === 'string') return ['1', 'true', 'yes'].includes(value.toLowerCase())
   return false
+}
+
+function asOptionalBoolean(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') {
+    if (value === 1) return true
+    if (value === 0) return false
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase()
+    if (['1', 'true', 'yes'].includes(normalized)) return true
+    if (['0', 'false', 'no'].includes(normalized)) return false
+  }
+  return undefined
 }
 
 export function unwrap(payload: unknown): unknown {
@@ -112,27 +189,29 @@ export function normalizeCountries(payload: unknown): CatalogOption[] {
   return normalizeOptions(
     payload,
     ['countries', 'items'],
-    ['code', 'country', 'id', 'value'],
-    ['name', 'label', 'title', 'country_name'],
+    ['id', 'country', 'value', 'code'],
+    ['name', 'label', 'title', 'country_name', 'eng', 'english', 'nameEn', 'rus', 'chn'],
   )
 }
 
 export function normalizePrices(payload: unknown): PriceOption[] {
-  return entries(payload, ['prices', 'items', 'providers', 'offers'])
+  const normalized = entries(payload, ['prices', 'items', 'providers', 'offers'])
     .map(([entryKey, value], index) => {
       const raw = optionRecord(entryKey, value)
       const provider = asText(
         pick(raw, ['provider', 'provider_id', 'providerId', 'operator', 'vendor', 'supplier', 'name']),
       )
       const rawPrice = pick(raw, ['price', 'cost', 'amount', 'rate', 'value'])
-      const price = rawPrice === undefined ? undefined : asNumber(rawPrice)
+      const price = asOptionalNumber(rawPrice)
       const rawStock = pick(raw, ['stock', 'count', 'available', 'quantity'])
-      const stock = rawStock === undefined ? undefined : asNumber(rawStock)
+      const stock = asOptionalNumber(rawStock)
+      const tier = priceTierFromRecord(raw)
       const id = asText(
         pick(raw, ['id', 'code', 'key', 'provider_id', 'providerId']),
         `${provider}:${price ?? entryKey}`,
       )
       const parts = [price === undefined ? '价格待定' : `${formatNumber(price)} ₽`]
+      if (tier) parts.push(tier)
       if (provider) parts.push(provider)
       if (stock !== undefined) parts.push(`库存 ${formatNumber(stock)}`)
       return {
@@ -143,9 +222,24 @@ export function normalizePrices(payload: unknown): PriceOption[] {
         price,
         provider,
         stock,
+        tier,
         raw,
       } satisfies PriceOption
     })
+
+  return normalized
+    .map((item, originalIndex) => ({ item, originalIndex }))
+    .sort((left, right) => {
+      const leftPrice = left.item.price
+      const rightPrice = right.item.price
+      if (leftPrice === undefined && rightPrice === undefined) {
+        return left.originalIndex - right.originalIndex
+      }
+      if (leftPrice === undefined) return 1
+      if (rightPrice === undefined) return -1
+      return leftPrice - rightPrice || left.originalIndex - right.originalIndex
+    })
+    .map(({ item }) => item)
 }
 
 export function normalizeSettings(payload: unknown): SMSBowerSettings {
@@ -288,6 +382,72 @@ export function normalizeActivations(payload: unknown): ActivationView[] {
     .filter((item) => item.id)
 }
 
+function normalizeLoginState(value: unknown, valid?: boolean): GoPayLoginState {
+  const normalized = asText(value).trim().toLowerCase().replace(/[\s-]+/g, '_')
+  const aliases: Record<string, GoPayLoginState> = {
+    valid: 'valid',
+    active: 'valid',
+    authenticated: 'valid',
+    logged_in: 'valid',
+    online: 'valid',
+    invalid: 'invalid',
+    expired: 'invalid',
+    unauthenticated: 'invalid',
+    logged_out: 'invalid',
+    session_expired: 'invalid',
+    revoked: 'invalid',
+    checking: 'checking',
+    pending: 'checking',
+    refreshing: 'checking',
+    loading: 'checking',
+    unknown: 'unknown',
+  }
+  if (aliases[normalized]) return aliases[normalized]
+  if (valid === true) return 'valid'
+  if (valid === false) return 'invalid'
+  return 'unknown'
+}
+
+export function normalizeAccountLoginStatuses(payload: unknown): GoPayLoginStatusView[] {
+  return entries(payload, ['accounts', 'items', 'records'])
+    .map<GoPayLoginStatusView | null>(([, value], index) => {
+      if (!isRecord(value)) return null
+      const valid = asOptionalBoolean(pick(value, ['valid', 'is_valid', 'isValid']))
+      const status = normalizeLoginState(
+        pick(value, ['login_status', 'loginStatus', 'status', 'state']),
+        valid,
+      )
+      const phone = asText(
+        pick(value, ['phone_number', 'phoneNumber', 'phone', 'number']),
+      ).trim()
+      const id = asText(
+        pick(value, ['account_id', 'accountId', 'id']),
+        phone || `account-${index + 1}`,
+      )
+      return {
+        id,
+        phone: phone || '未提供号码',
+        status,
+        valid,
+        checkedAt: asText(pick(value, ['checked_at', 'checkedAt'])) || undefined,
+        message: asText(pick(value, ['message', 'detail', 'error'])) || undefined,
+        refreshed: asOptionalBoolean(pick(value, ['refreshed', 'was_refreshed', 'wasRefreshed'])) ?? false,
+        raw: value,
+      }
+    })
+    .filter((item): item is GoPayLoginStatusView => item !== null)
+}
+
+export function accountLoginStatus(status: GoPayLoginState): StatusMeta {
+  const statuses: Record<GoPayLoginState, StatusMeta> = {
+    valid: { label: '登录有效', type: 'success', active: false },
+    invalid: { label: '登录已失效', type: 'danger', active: false },
+    checking: { label: '检查中', type: 'primary', active: true },
+    unknown: { label: '状态未知', type: 'info', active: false },
+  }
+  return statuses[status]
+}
+
 const statusMap: Record<string, StatusMeta> = {
   pending: { label: '等待处理', type: 'info', active: true },
   purchasing: { label: '购买中', type: 'primary', active: true },
@@ -305,9 +465,11 @@ const statusMap: Record<string, StatusMeta> = {
   preparing_pin: { label: '准备设置 PIN', type: 'primary', active: true },
   waiting_pin_otp: { label: '等待改 PIN 验证码', type: 'warning', active: true },
   awaiting_pin_code: { label: '等待改 PIN 验证码', type: 'warning', active: true },
-  setting_pin: { label: '设置 PIN 中', type: 'primary', active: true },
-  polling: { label: '持有中', type: 'success', active: true },
-  active: { label: '持有中', type: 'success', active: true },
+  setting_pin: { label: '正在设置 PIN', type: 'primary', active: true },
+  pin_changed: { label: '改 PIN 成功', type: 'success', active: true },
+  awaiting_subsequent_code: { label: '等待后续验证码', type: 'success', active: true },
+  polling: { label: '等待后续验证码', type: 'success', active: true },
+  active: { label: '等待后续验证码', type: 'success', active: true },
   success: { label: '成功', type: 'success', active: false },
   expired: { label: '过期', type: 'info', active: false },
   cancelled: { label: '已取消', type: 'info', active: false },
@@ -354,4 +516,15 @@ export function formatTime(value?: string): string {
     second: '2-digit',
     hour12: false,
   }).format(date)
+}
+
+export function formatCountdown(value?: string, now = Date.now()): string {
+  if (!value || !Number.isFinite(now)) return '—'
+  const expiresAt = new Date(value).getTime()
+  if (!Number.isFinite(expiresAt)) return '—'
+
+  const totalSeconds = Math.max(0, Math.ceil((expiresAt - now) / 1_000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${String(minutes).padStart(2, '0')}分${String(seconds).padStart(2, '0')}秒`
 }

@@ -337,6 +337,90 @@ textarea {
   width: 100%;
 }
 
+.price-picker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  width: 100%;
+}
+
+.price-field-content {
+  width: 100%;
+}
+
+.price-picker .el-select {
+  min-width: 0;
+}
+
+.price-refresh-button {
+  min-height: 42px;
+  margin-left: 0 !important;
+  padding: 0 12px;
+  border-radius: 10px;
+  font-weight: 650;
+}
+
+.price-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  width: 100%;
+}
+
+.price-option__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.price-tier {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  min-height: 20px;
+  padding: 2px 7px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 750;
+  line-height: 1;
+}
+
+.price-tier.price-tier--bronze {
+  color: #8a4b27;
+  border-color: #e8c2a9;
+  background: #fff3e9;
+}
+
+.price-tier.price-tier--silver {
+  color: #5f6d82;
+  border-color: #d6dde7;
+  background: #f4f6f9;
+}
+
+.price-tier.price-tier--gold {
+  color: #926600;
+  border-color: #eed58d;
+  background: #fff8d8;
+}
+
+.price-tier-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.price-tier-legend > span:first-child {
+  margin-right: 2px;
+}
+
 .proxy-pool-field {
   width: 100%;
   margin-top: 14px;
@@ -385,6 +469,10 @@ textarea {
 .selection-summary strong {
   color: var(--ink);
   font-size: 18px;
+}
+
+.selection-summary .price-tier {
+  font-size: 10px;
 }
 
 .start-button {
@@ -505,6 +593,77 @@ textarea {
   min-width: 0;
 }
 
+.activation-card__status-stack {
+  display: flex;
+  align-items: flex-end;
+  flex: none;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.activation-login-status {
+  min-width: 152px;
+  max-width: 230px;
+  padding: 7px 9px;
+  color: #526178;
+  border: 1px solid #dfe5ed;
+  border-radius: 9px;
+  background: #f5f7fa;
+}
+
+.activation-login-status.is-valid {
+  color: #177b5d;
+  border-color: #ccebdd;
+  background: #eef9f5;
+}
+
+.activation-login-status.is-invalid {
+  color: #b13a47;
+  border-color: #f3cfd3;
+  background: #fff3f4;
+}
+
+.activation-login-status.is-checking {
+  color: #245fc8;
+  border-color: #d2e0fb;
+  background: #f1f6ff;
+}
+
+.activation-login-status__primary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 750;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+
+.activation-login-status__dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 0 3px rgba(82, 97, 120, 0.1);
+}
+
+.activation-login-status.is-checking .activation-login-status__dot {
+  animation: pulse 1.8s infinite;
+}
+
+.activation-login-status small {
+  display: block;
+  overflow: hidden;
+  margin-top: 3px;
+  color: currentColor;
+  font-size: 9px;
+  line-height: 1.35;
+  opacity: 0.78;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .activation-card__eyebrow {
   display: block;
   margin-bottom: 5px;
@@ -584,6 +743,19 @@ textarea {
 
 .activation-card__meta .balance-positive {
   color: var(--green);
+}
+
+.activation-card__meta .activation-countdown {
+  display: block;
+  overflow: hidden;
+  margin-top: 5px;
+  color: var(--accent);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .code-grid {
@@ -839,6 +1011,14 @@ textarea {
 
   .activation-card__header {
     align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .activation-card__status-stack {
+    align-items: center;
+    flex-direction: row;
+    flex-wrap: wrap;
+    width: 100%;
   }
 
   .activation-card__meta {

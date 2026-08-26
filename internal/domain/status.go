@@ -31,7 +31,8 @@ func (s ActivationStatus) Valid() bool {
 	case ActivationStatusPurchased, ActivationStatusDuplicate, ActivationStatusAwaitingLoginCode,
 		ActivationStatusLoggingIn, ActivationStatusPINRequired, ActivationStatusUnregistered,
 		ActivationStatusCheckingBalance, ActivationStatusZeroBalanceUsed, ActivationStatusSettingPIN,
-		ActivationStatusAwaitingPINCode, ActivationStatusActive, ActivationStatusSuccess,
+		ActivationStatusAwaitingPINCode, ActivationStatusPINChanged, ActivationStatusAwaitingSubsequentCode,
+		ActivationStatusActive, ActivationStatusSuccess,
 		ActivationStatusExpired, ActivationStatusCancelled, ActivationStatusFailed:
 		return true
 	default:

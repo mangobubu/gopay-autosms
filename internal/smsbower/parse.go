@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -109,12 +110,17 @@ func parseCountries(action string, body []byte) ([]Country, error) {
 				name = firstNonEmpty(eng, rus, chn)
 			}
 			if hasID && name != "" {
+				iso, _ := lookupString(node, "iso", "iso2", "isoCode", "countryIso", "alpha2", "alpha_2", "countryCode", "country_code", "code", "country")
+				iso = normalizeISOCode(iso)
+				if iso == "" {
+					iso = countryISOCode(id)
+				}
 				visible, _ := lookupBool(node, "visible")
 				retry, _ := lookupBool(node, "retry")
 				rent, _ := lookupBool(node, "rent")
 				multi, _ := lookupBool(node, "multiService")
 				countries[id] = Country{
-					ID: id, Name: name, EnglishName: eng, RussianName: rus,
+					ID: id, Name: name, ISOCode: iso, EnglishName: eng, RussianName: rus,
 					ChineseName: chn, Visible: visible, Retry: retry, Rent: rent,
 					MultiService: multi, Raw: marshalRaw(node),
 				}
@@ -124,7 +130,7 @@ func parseCountries(action string, body []byte) ([]Country, error) {
 				if !isMetadataKey(key) {
 					if id, validID := parseInt(key); validID {
 						if scalar, scalarOK := scalarString(item); scalarOK && scalar != "" {
-							countries[id] = Country{ID: id, Name: scalar, Raw: marshalRaw(item)}
+							countries[id] = Country{ID: id, Name: scalar, ISOCode: countryISOCode(id), Raw: marshalRaw(item)}
 							continue
 						}
 					}
@@ -163,6 +169,7 @@ func parsePrices(action string, body []byte) ([]Price, error) {
 			price, hasPrice := lookupString(node, "price", "cost", "activationCost", "retailPrice")
 			if hasPrice {
 				country, service, providerID := pricePath(path)
+				tier := priceTier(path)
 				if value, ok := lookupInt(node, "country", "countryId"); ok {
 					country = value
 				}
@@ -172,9 +179,12 @@ func parsePrices(action string, body []byte) ([]Price, error) {
 				if value, ok := lookupInt64(node, "providerId", "provider"); ok {
 					providerID = value
 				}
+				if normalized := priceTierFromNode(node); normalized != "" {
+					tier = normalized
+				}
 				count, _ := lookupInt(node, "count", "quantity", "available")
 				result = append(result, Price{
-					Country: country, Service: service, ProviderID: providerID,
+					Country: country, Service: service, ProviderID: providerID, Tier: tier,
 					Price: price, Count: count, Raw: marshalRaw(node),
 				})
 				return
@@ -191,7 +201,7 @@ func parsePrices(action string, body []byte) ([]Price, error) {
 					}
 					count, _ := strconv.Atoi(countText)
 					result = append(result, Price{
-						Country: country, Service: service, ProviderID: providerID,
+						Country: country, Service: service, ProviderID: providerID, Tier: priceTier(path),
 						Price: key, Count: count, Raw: marshalRaw(item),
 					})
 					continue
@@ -211,15 +221,24 @@ func parsePrices(action string, body []byte) ([]Price, error) {
 		if result[i].Service != result[j].Service {
 			return result[i].Service < result[j].Service
 		}
-		if result[i].ProviderID != result[j].ProviderID {
-			return result[i].ProviderID < result[j].ProviderID
-		}
-		left, leftErr := strconv.ParseFloat(result[i].Price, 64)
-		right, rightErr := strconv.ParseFloat(result[j].Price, 64)
+		left, leftErr := parsePriceValue(result[i].Price)
+		right, rightErr := parsePriceValue(result[j].Price)
 		if leftErr == nil && rightErr == nil && left != right {
 			return left < right
 		}
-		return result[i].Price < result[j].Price
+		if leftErr == nil && rightErr != nil {
+			return true
+		}
+		if leftErr != nil && rightErr == nil {
+			return false
+		}
+		if result[i].Price != result[j].Price {
+			return result[i].Price < result[j].Price
+		}
+		if result[i].ProviderID != result[j].ProviderID {
+			return result[i].ProviderID < result[j].ProviderID
+		}
+		return priceTierOrder(result[i].Tier) < priceTierOrder(result[j].Tier)
 	})
 	return result, nil
 }
@@ -635,7 +654,7 @@ func pricePath(path []string) (country int, service string, providerID int64) {
 	}
 	for index := countryIndex + 1; index < len(path); index++ {
 		segment := path[index]
-		if isMetadataKey(segment) {
+		if isMetadataKey(segment) || normalizePriceTier(segment) != "" {
 			continue
 		}
 		if value, err := strconv.ParseInt(segment, 10, 64); err == nil {
@@ -651,6 +670,112 @@ func pricePath(path []string) (country int, service string, providerID int64) {
 	return country, service, providerID
 }
 
+func priceTier(path []string) string {
+	for _, segment := range path {
+		if tier := normalizePriceTier(segment); tier != "" {
+			return tier
+		}
+	}
+	return ""
+}
+
+func priceTierFromNode(node map[string]any) string {
+	for _, key := range []string{
+		"tier", "rank", "grade", "level", "quality",
+		"providerTier", "providerRank", "providerLevel", "providerGrade", "providerQuality",
+	} {
+		if value, ok := lookup(node, key); ok {
+			if tier := normalizePriceTierValue(value); tier != "" {
+				return tier
+			}
+		}
+	}
+	return ""
+}
+
+func normalizePriceTierValue(value any) string {
+	if scalar, ok := scalarString(value); ok {
+		if tier := normalizePriceTier(scalar); tier != "" {
+			return tier
+		}
+		if numeric, err := strconv.Atoi(strings.TrimSpace(scalar)); err == nil {
+			switch numeric {
+			case 1:
+				return "Gold"
+			case 2:
+				return "Silver"
+			case 3:
+				return "Bronze"
+			}
+		}
+		return ""
+	}
+
+	switch value := value.(type) {
+	case map[string]any:
+		// Human-readable fields take precedence when a gateway sends both a
+		// description and its numeric rank ID.
+		for _, key := range []string{"description", "name", "tier", "rank", "level", "grade", "quality"} {
+			if nested, ok := lookup(value, key); ok {
+				if tier := normalizePriceTierValue(nested); tier != "" {
+					return tier
+				}
+			}
+		}
+		for _, key := range []string{"id", "value", "code"} {
+			if nested, ok := lookup(value, key); ok {
+				if tier := normalizePriceTierValue(nested); tier != "" {
+					return tier
+				}
+			}
+		}
+	case []any:
+		for _, nested := range value {
+			if tier := normalizePriceTierValue(nested); tier != "" {
+				return tier
+			}
+		}
+	}
+	return ""
+}
+
+func normalizePriceTier(value string) string {
+	switch normalizeKey(value) {
+	case "bronze", "bronzetier", "bronzerank":
+		return "Bronze"
+	case "silver", "silvertier", "silverrank":
+		return "Silver"
+	case "gold", "goldtier", "goldrank":
+		return "Gold"
+	default:
+		return ""
+	}
+}
+
+func priceTierOrder(value string) int {
+	switch normalizePriceTier(value) {
+	case "Bronze":
+		return 0
+	case "Silver":
+		return 1
+	case "Gold":
+		return 2
+	default:
+		return 3
+	}
+}
+
+func parsePriceValue(value string) (float64, error) {
+	parsed, err := strconv.ParseFloat(strings.ReplaceAll(strings.TrimSpace(value), ",", "."), 64)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return 0, fmt.Errorf("price is not finite")
+	}
+	return parsed, nil
+}
+
 func normalizeKey(value string) string {
 	return strings.Map(func(r rune) rune {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
@@ -658,6 +783,14 @@ func normalizeKey(value string) string {
 		}
 		return -1
 	}, value)
+}
+
+func normalizeISOCode(value string) string {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	if len(value) != 2 || value[0] < 'A' || value[0] > 'Z' || value[1] < 'A' || value[1] > 'Z' {
+		return ""
+	}
+	return value
 }
 
 func isMetadataKey(key string) bool {

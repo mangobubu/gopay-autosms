@@ -13,10 +13,13 @@ export interface CatalogOption {
   raw: UnknownRecord
 }
 
+export type PriceTier = 'Bronze' | 'Silver' | 'Gold'
+
 export interface PriceOption extends CatalogOption {
   price?: number
   provider?: string
   stock?: number
+  tier?: PriceTier
 }
 
 export interface BatchRequest {
@@ -71,6 +74,19 @@ export interface ActivationView {
   createdAt?: string
   expiresAt?: string
   finishedAt?: string
+  raw: UnknownRecord
+}
+
+export type GoPayLoginState = 'valid' | 'invalid' | 'unknown' | 'checking'
+
+export interface GoPayLoginStatusView {
+  id: string
+  phone: string
+  status: GoPayLoginState
+  valid?: boolean
+  checkedAt?: string
+  message?: string
+  refreshed: boolean
   raw: UnknownRecord
 }
 

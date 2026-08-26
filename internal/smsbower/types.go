@@ -59,6 +59,7 @@ type Service struct {
 type Country struct {
 	ID           int             `json:"id"`
 	Name         string          `json:"name"`
+	ISOCode      string          `json:"iso,omitempty"`
 	EnglishName  string          `json:"eng,omitempty"`
 	RussianName  string          `json:"rus,omitempty"`
 	ChineseName  string          `json:"chn,omitempty"`
@@ -85,6 +86,7 @@ type Price struct {
 	Country    int             `json:"country"`
 	Service    string          `json:"service"`
 	ProviderID int64           `json:"providerId,omitempty"`
+	Tier       string          `json:"tier,omitempty"`
 	Price      string          `json:"price"`
 	Count      int             `json:"count"`
 	Raw        json.RawMessage `json:"-"`

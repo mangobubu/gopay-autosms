@@ -24,11 +24,16 @@ const (
 type PINStage string
 
 const (
-	PINStageIdle       PINStage = ""
-	PINStageReadyCycle PINStage = "ready_pin_cycle"
-	PINStageCycleReady PINStage = "pin_cycle_ready"
-	PINStageAwaiting   PINStage = "awaiting_pin_otp"
-	PINStageComplete   PINStage = "pin_complete"
+	PINStageIdle            PINStage = ""
+	PINStageReadyCycle      PINStage = "ready_pin_cycle"
+	PINStageCycleReady      PINStage = "pin_cycle_ready"
+	PINStageAwaiting        PINStage = "awaiting_pin_otp"
+	PINStageSetupVerified   PINStage = "pin_setup_otp_verified"
+	PINStageResetReadyCycle PINStage = "ready_pin_reset_cycle"
+	PINStageResetCycleReady PINStage = "pin_reset_cycle_ready"
+	PINStageResetAwaiting   PINStage = "awaiting_pin_reset_otp"
+	PINStageResetVerified   PINStage = "pin_reset_otp_verified"
+	PINStageComplete        PINStage = "pin_complete"
 )
 
 // Session contains all protocol state needed to resume a multi-request login
@@ -59,8 +64,15 @@ type Session struct {
 	PINVerificationID    string   `json:"pin_verification_id"`
 	PINOTPToken          string   `json:"pin_otp_token"`
 	PINVerificationToken string   `json:"pin_verification_token"`
+	PINChallengeID       string   `json:"pin_challenge_id,omitempty"`
+	PINClientID          string   `json:"pin_client_id,omitempty"`
 	PINToken             string   `json:"pin_token,omitempty"`
 	PINStage             PINStage `json:"pin_stage,omitempty"`
+}
+
+type PINStatus struct {
+	Known bool `json:"known"`
+	Set   bool `json:"set"`
 }
 
 func (s Session) Marshal() ([]byte, error) { return json.Marshal(s) }

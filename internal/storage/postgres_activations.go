@@ -329,7 +329,7 @@ func (s *PostgresStore) ClaimRunnableActivations(
 		FOR UPDATE SKIP LOCKED
 		LIMIT $4
 	)
-	UPDATE activations a SET lease_owner=$1 || ':' || a.id, lease_until=$3,
+	UPDATE activations a SET lease_owner=$1 || ':' || a.id || ':' || (a.lease_version+1), lease_until=$3,
 		lease_version=lease_version+1, updated_at=now()
 	FROM candidates c WHERE a.id=c.id
 	RETURNING ` + prefixedActivationColumns("a")
@@ -655,7 +655,7 @@ func (s *PostgresStore) markActivationFulfilled(ctx context.Context, id int64, o
 		}
 		return false, nil
 	}
-	if domain.ActivationStatus(status) != domain.ActivationStatusAwaitingPINCode || !slotReserved {
+	if domain.ActivationStatus(status) != domain.ActivationStatusSettingPIN || !slotReserved {
 		return false, ErrConflict
 	}
 	updateQuery := `UPDATE activations SET ever_fulfilled=true, slot_reserved=false, updated_at=now() WHERE id=$1`

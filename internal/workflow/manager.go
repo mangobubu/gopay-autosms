@@ -26,11 +26,15 @@ import (
 type Config struct {
 	PollInterval  time.Duration
 	ActivationTTL time.Duration
-	SchedulerTick time.Duration
-	LeaseDuration time.Duration
-	WorkerCount   int
-	SSOBaseURL    string
-	GoPayBaseURL  string
+	// LoginStatusTTL bounds how long a remote GoPay profile result is reused.
+	// Keep the default below the UI's five-second interval so timer and request
+	// latency cannot stretch normal remote probes to every other browser poll.
+	LoginStatusTTL time.Duration
+	SchedulerTick  time.Duration
+	LeaseDuration  time.Duration
+	WorkerCount    int
+	SSOBaseURL     string
+	GoPayBaseURL   string
 }
 
 type BatchOptions struct {
@@ -75,6 +79,17 @@ type Manager struct {
 	purchase    sync.Mutex
 	proxyMu     sync.Mutex
 	activeProxy map[int64]map[string]struct{}
+
+	loginStatusMu       sync.Mutex
+	loginStatusCache    map[int64]loginStatusCacheEntry
+	loginStatusFlights  map[int64]*loginStatusFlight
+	accountSessionMu    sync.Mutex
+	accountSessionLocks map[string]*accountSessionLockEntry
+}
+
+type accountSessionLockEntry struct {
+	gate chan struct{}
+	refs int
 }
 
 func New(store storage.Store, settings *appsettings.Manager, box *secure.Box, cfg Config, logger *slog.Logger) *Manager {
@@ -84,11 +99,17 @@ func New(store storage.Store, settings *appsettings.Manager, box *secure.Box, cf
 	if cfg.ActivationTTL <= 0 {
 		cfg.ActivationTTL = 20 * time.Minute
 	}
+	if cfg.LoginStatusTTL <= 0 {
+		cfg.LoginStatusTTL = 4 * time.Second
+	}
 	if cfg.SchedulerTick <= 0 {
 		cfg.SchedulerTick = 500 * time.Millisecond
 	}
 	if cfg.LeaseDuration <= 0 {
-		cfg.LeaseDuration = 45 * time.Second
+		// A PIN reset is a sequence of several independently signed remote
+		// requests, each with its own network timeout. Keep one worker fenced for
+		// the complete step instead of allowing a second worker to overlap it.
+		cfg.LeaseDuration = 3 * time.Minute
 	}
 	if cfg.WorkerCount <= 0 {
 		cfg.WorkerCount = 8
@@ -99,7 +120,10 @@ func New(store storage.Store, settings *appsettings.Manager, box *secure.Box, cf
 	return &Manager{
 		store: store, settings: settings, box: box, cfg: cfg, logger: logger,
 		owner: fmt.Sprintf("autosms-%d", time.Now().UnixNano()), sem: make(chan struct{}, cfg.WorkerCount),
-		activeProxy: make(map[int64]map[string]struct{}),
+		activeProxy:         make(map[int64]map[string]struct{}),
+		loginStatusCache:    make(map[int64]loginStatusCacheEntry),
+		loginStatusFlights:  make(map[int64]*loginStatusFlight),
+		accountSessionLocks: make(map[string]*accountSessionLockEntry),
 	}
 }
 
@@ -299,8 +323,8 @@ func (m *Manager) MarkSuccess(ctx context.Context, activationID int64) error {
 	if err != nil {
 		return err
 	}
-	if activation.Status != domain.ActivationStatusActive {
-		return fmt.Errorf("%w: only active numbers can be marked successful", storage.ErrConflict)
+	if activation.Status != domain.ActivationStatusActive && activation.Status != domain.ActivationStatusAwaitingSubsequentCode {
+		return fmt.Errorf("%w: only numbers waiting for subsequent codes can be marked successful", storage.ErrConflict)
 	}
 	return m.store.SetControlAction(ctx, activationID, domain.ControlActionSuccess)
 }
@@ -442,6 +466,17 @@ func (m *Manager) noteBatchError(ctx context.Context, batch domain.Batch, err er
 }
 
 func (m *Manager) processActivation(ctx context.Context, activation domain.Activation) {
+	// A status probe can refresh the same account session that this worker is
+	// advancing. Serialize them by phone so an older worker snapshot cannot
+	// overwrite a freshly rotated token in this process.
+	releaseAccount, lockErr := m.acquireAccountSessionLock(ctx, activation.PhoneNumber)
+	if lockErr != nil {
+		m.logger.Warn("acquire account session lock", "activation_id", activation.ID, "error", lockErr)
+		_ = m.store.ReleaseActivationLease(ctx, activation.ID, activation.LeaseOwner, time.Now().UTC().Add(m.cfg.PollInterval))
+		return
+	}
+	defer releaseAccount()
+
 	var err error
 	if activation.ControlAction != domain.ControlActionNone {
 		err = m.processControl(ctx, activation)
@@ -475,6 +510,20 @@ func (m *Manager) processActivation(ctx context.Context, activation domain.Activ
 			} else {
 				err = m.pollPINCode(ctx, activation)
 			}
+		case domain.ActivationStatusSettingPIN:
+			if m.activationExpired(activation) {
+				err = m.expireAndCancel(ctx, activation)
+			} else {
+				err = m.completePINSetting(ctx, activation)
+			}
+		case domain.ActivationStatusPINChanged:
+			err = m.transitionToSubsequentPolling(ctx, activation)
+		case domain.ActivationStatusAwaitingSubsequentCode:
+			if m.activationExpired(activation) {
+				err = m.expireAndCancel(ctx, activation)
+			} else {
+				err = m.pollFollowupCode(ctx, activation)
+			}
 		case domain.ActivationStatusActive:
 			if m.activationExpired(activation) {
 				err = m.expireAndCancel(ctx, activation)
@@ -487,6 +536,16 @@ func (m *Manager) processActivation(ctx context.Context, activation domain.Activ
 	}
 	if err != nil {
 		m.logger.Warn("activation step failed", "activation_id", activation.ID, "state", activation.Status, "error", err)
+		// Keep the last actionable reason with the activation so the dashboard
+		// does not present a consumed/failed OTP as if it were still pending.
+		// This is best-effort: lease ownership remains the source of truth.
+		reason := err.Error()
+		if len(reason) > 500 {
+			reason = reason[:500]
+		}
+		_, _ = m.store.TransitionActivationOwned(ctx, activation.ID,
+			[]domain.ActivationStatus{activation.Status}, activation.Status, reason,
+			activation.LeaseOwner, activation.LeaseVersion)
 		// Protocol/network errors are recoverable. Keep the exact state and try
 		// again; explicit business classifications transition to terminal states.
 		_ = m.store.ReleaseActivationLease(ctx, activation.ID, activation.LeaseOwner, time.Now().UTC().Add(m.cfg.PollInterval))
@@ -497,8 +556,72 @@ func (m *Manager) processActivation(ctx context.Context, activation domain.Activ
 		m.releaseActivationProxy(ctx, latest)
 	}
 	if latestErr == nil && !latest.Status.Terminal() {
-		_ = m.store.ReleaseActivationLease(ctx, activation.ID, latest.LeaseOwner, latest.NextRunAt)
+		// Release only the lease claimed by this worker. A newer claim has a
+		// distinct owner and must never be released by a slow previous worker.
+		_ = m.store.ReleaseActivationLease(ctx, activation.ID, activation.LeaseOwner, latest.NextRunAt)
 	}
+}
+
+func (m *Manager) acquireAccountSessionLock(ctx context.Context, phone string) (func(), error) {
+	key := strings.TrimSpace(phone)
+	if normalized, err := domain.NormalizePhone(key); err == nil {
+		key = normalized
+	}
+
+	m.accountSessionMu.Lock()
+	if m.accountSessionLocks == nil {
+		m.accountSessionLocks = make(map[string]*accountSessionLockEntry)
+	}
+	entry := m.accountSessionLocks[key]
+	if entry == nil {
+		entry = &accountSessionLockEntry{gate: make(chan struct{}, 1)}
+		m.accountSessionLocks[key] = entry
+	}
+	entry.refs++
+	m.accountSessionMu.Unlock()
+
+	select {
+	case entry.gate <- struct{}{}:
+	case <-ctx.Done():
+		m.releaseAccountSessionEntry(key, entry, false)
+		return nil, ctx.Err()
+	}
+
+	var distributedRelease func(context.Context) error
+	if locker, ok := m.store.(storage.AccountSessionLockStore); ok {
+		var err error
+		distributedRelease, err = locker.AcquireAccountSessionLock(ctx, key)
+		if err != nil {
+			m.releaseAccountSessionEntry(key, entry, true)
+			return nil, err
+		}
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if distributedRelease != nil {
+				releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := distributedRelease(releaseCtx); err != nil {
+					m.logger.Warn("release distributed account session lock", "phone", key, "error", err)
+				}
+				cancel()
+			}
+			m.releaseAccountSessionEntry(key, entry, true)
+		})
+	}, nil
+}
+
+func (m *Manager) releaseAccountSessionEntry(key string, entry *accountSessionLockEntry, acquired bool) {
+	if acquired {
+		<-entry.gate
+	}
+	m.accountSessionMu.Lock()
+	entry.refs--
+	if entry.refs == 0 && m.accountSessionLocks[key] == entry {
+		delete(m.accountSessionLocks, key)
+	}
+	m.accountSessionMu.Unlock()
 }
 
 func (m *Manager) releaseActivationProxy(ctx context.Context, activation domain.Activation) {
@@ -525,11 +648,15 @@ func (m *Manager) expireAndCancel(ctx context.Context, activation domain.Activat
 	if err != nil {
 		return err
 	}
-	if _, cancelErr := client.SetStatus(ctx, activation.ProviderActivationID, smsbower.SetStatusCancel); cancelErr != nil && !smsbower.IsAPIError(cancelErr, "NO_ACTIVATION") {
+	if _, cancelErr := client.SetStatus(ctx, activation.ProviderActivationID, smsbower.SetStatusCancel); !providerActionConcluded(cancelErr) {
 		return cancelErr
 	}
 	_, err = m.store.TransitionActivationOwned(ctx, activation.ID, nil, domain.ActivationStatusExpired, "号码已过期", activation.LeaseOwner, activation.LeaseVersion)
 	return err
+}
+
+func providerActionConcluded(err error) bool {
+	return err == nil || smsbower.IsAPIError(err, "NO_ACTIVATION") || smsbower.IsAPIError(err, "BAD_STATUS")
 }
 
 func (m *Manager) processControl(ctx context.Context, activation domain.Activation) error {
@@ -539,13 +666,13 @@ func (m *Manager) processControl(ctx context.Context, activation domain.Activati
 	}
 	switch activation.ControlAction {
 	case domain.ControlActionSuccess:
-		if _, err = client.SetStatus(ctx, activation.ProviderActivationID, smsbower.SetStatusComplete); err != nil && !smsbower.IsAPIError(err, "NO_ACTIVATION") {
+		if _, err = client.SetStatus(ctx, activation.ProviderActivationID, smsbower.SetStatusComplete); !providerActionConcluded(err) {
 			return err
 		}
 		_, err = m.store.TransitionActivationOwned(ctx, activation.ID, []domain.ActivationStatus{activation.Status}, domain.ActivationStatusSuccess, "", activation.LeaseOwner, activation.LeaseVersion)
 		return err
 	case domain.ControlActionDelete:
-		if _, err = client.SetStatus(ctx, activation.ProviderActivationID, smsbower.SetStatusCancel); err != nil && !smsbower.IsAPIError(err, "NO_ACTIVATION") {
+		if _, err = client.SetStatus(ctx, activation.ProviderActivationID, smsbower.SetStatusCancel); !providerActionConcluded(err) {
 			return err
 		}
 		_, err = m.store.TransitionActivationOwned(ctx, activation.ID, []domain.ActivationStatus{activation.Status}, domain.ActivationStatusCancelled, "手动删除", activation.LeaseOwner, activation.LeaseVersion)
@@ -634,7 +761,7 @@ func (m *Manager) finalizeProviderAction(ctx context.Context, activation domain.
 		return err
 	}
 	_, err = client.SetStatus(ctx, activation.ProviderActivationID, action)
-	if err != nil && !smsbower.IsAPIError(err, "NO_ACTIVATION") {
+	if !providerActionConcluded(err) {
 		return err
 	}
 	_, err = m.store.FinalizeActivationOwned(ctx, activation.ID, []domain.ActivationStatus{activation.Status}, activation.LeaseOwner, activation.LeaseVersion)
@@ -715,7 +842,9 @@ func (m *Manager) checkBalance(ctx context.Context, activation domain.Activation
 	}
 	balance, err := client.GetBalance(ctx)
 	if isHTTPStatus(err, 401) {
-		if refreshErr := client.Refresh(ctx); refreshErr == nil {
+		if refreshErr := m.refreshAndPersistSession(ctx, activation, client, targetPIN, domain.AccountStatusAuthenticated, activation.BalanceRP); refreshErr != nil {
+			err = refreshErr
+		} else {
 			balance, err = client.GetBalance(ctx)
 		}
 	}
@@ -744,8 +873,29 @@ func (m *Manager) checkBalance(ctx context.Context, activation domain.Activation
 	if balance.Amount < 0 {
 		return gopay.ErrBalanceUnknown
 	}
+	// Select reset immediately when the authenticated profile exposes an
+	// existing PIN. Compatible deployments which omit the flag or profile
+	// endpoint still fall back to setup; GoPay-111 remains the authoritative
+	// setup-to-reset fallback.
+	pinStage := gopay.PINStageReadyCycle
+	pinStatus, pinStatusErr := client.GetPINStatus(ctx)
+	if isHTTPStatus(pinStatusErr, 401) {
+		if refreshErr := m.refreshAndPersistSession(ctx, activation, client, targetPIN, domain.AccountStatusAuthenticated, &amount); refreshErr != nil {
+			return refreshErr
+		} else {
+			pinStatus, pinStatusErr = client.GetPINStatus(ctx)
+		}
+	}
+	if isHTTPStatus(pinStatusErr, 401) {
+		return pinStatusErr
+	}
+	if pinStatusErr == nil && pinStatus.Known && pinStatus.Set {
+		pinStage = gopay.PINStageResetReadyCycle
+	} else if pinStatusErr != nil {
+		m.logger.Debug("PIN profile probe unavailable; falling back to setup", "activation_id", activation.ID, "error", pinStatusErr)
+	}
 	state := client.State()
-	state.PINStage = gopay.PINStageReadyCycle
+	state.PINStage = pinStage
 	state.SMSCycle = activation.SMSCycle
 	client.Restore(state)
 	if _, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, &amount); err != nil {
@@ -782,8 +932,41 @@ func (m *Manager) pollPINCode(ctx context.Context, activation domain.Activation)
 	case gopay.PINStageCycleReady:
 		if _, err = client.StartPINSetup(ctx, targetPIN); err != nil {
 			if isHTTPStatus(err, 401) {
-				if refreshErr := client.Refresh(ctx); refreshErr == nil {
+				if refreshErr := m.refreshAndPersistSession(ctx, activation, client, targetPIN, domain.AccountStatusPINPending, activation.BalanceRP); refreshErr != nil {
+					err = refreshErr
+				} else {
 					_, err = client.StartPINSetup(ctx, targetPIN)
+				}
+			}
+			if errors.Is(err, gopay.ErrPINAlreadySet) {
+				return m.preparePINReset(ctx, activation, client, targetPIN)
+			}
+			if err != nil {
+				return err
+			}
+		}
+		_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
+		return err
+	case gopay.PINStageResetReadyCycle:
+		cycle := activation.SMSCycle
+		if state.SMSCycle >= activation.SMSCycle {
+			cycle, err = m.requestAnother(ctx, activation)
+			if err != nil {
+				return err
+			}
+		}
+		state.PINStage = gopay.PINStageResetCycleReady
+		state.SMSCycle = cycle
+		client.Restore(state)
+		_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
+		return err
+	case gopay.PINStageResetCycleReady:
+		if _, err = client.StartPINReset(ctx, targetPIN); err != nil {
+			if isHTTPStatus(err, 401) {
+				if refreshErr := m.refreshAndPersistSession(ctx, activation, client, targetPIN, domain.AccountStatusPINPending, activation.BalanceRP); refreshErr != nil {
+					err = refreshErr
+				} else {
+					_, err = client.StartPINReset(ctx, targetPIN)
 				}
 			}
 			if err != nil {
@@ -792,24 +975,8 @@ func (m *Manager) pollPINCode(ctx context.Context, activation domain.Activation)
 		}
 		_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
 		return err
-	case gopay.PINStageComplete:
-		cycle := activation.SMSCycle
-		if state.SMSCycle >= activation.SMSCycle {
-			cycle, err = m.requestAnother(ctx, activation)
-			if err != nil {
-				return err
-			}
-			state.SMSCycle = cycle
-			client.Restore(state)
-			if _, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusActive, activation.BalanceRP); err != nil {
-				return err
-			}
-		}
-		if _, err = m.store.MarkActivationFulfilledOwned(ctx, activation.ID, activation.LeaseOwner, activation.LeaseVersion); err != nil {
-			return err
-		}
-		_, err = m.store.TransitionActivationOwned(ctx, activation.ID, []domain.ActivationStatus{domain.ActivationStatusAwaitingPINCode}, domain.ActivationStatusActive, "", activation.LeaseOwner, activation.LeaseVersion)
-		return err
+	case gopay.PINStageSetupVerified, gopay.PINStageResetVerified, gopay.PINStageComplete:
+		return m.publishPINSettingState(ctx, activation)
 	}
 
 	status, err := m.pollStatus(ctx, activation)
@@ -820,21 +987,177 @@ func (m *Manager) pollPINCode(ctx context.Context, activation domain.Activation)
 	if err != nil {
 		return err
 	}
-	if err = client.FinishPINSetup(ctx, targetPIN, storedCode); err != nil {
+	if state.PINStage == gopay.PINStageResetAwaiting {
+		err = client.VerifyPINResetOTP(ctx, storedCode)
+	} else {
+		err = client.VerifyPINSetupOTP(ctx, storedCode)
+	}
+	if err != nil {
 		if isHTTPStatus(err, 401) {
-			if refreshErr := client.Refresh(ctx); refreshErr == nil {
-				err = client.FinishPINSetup(ctx, targetPIN, storedCode)
+			if refreshErr := m.refreshAndPersistSession(ctx, activation, client, targetPIN, domain.AccountStatusPINPending, activation.BalanceRP); refreshErr != nil {
+				err = refreshErr
+			} else {
+				if state.PINStage == gopay.PINStageResetAwaiting {
+					err = client.VerifyPINResetOTP(ctx, storedCode)
+				} else {
+					err = client.VerifyPINSetupOTP(ctx, storedCode)
+				}
 			}
 		}
-		if err != nil {
-			return err
-		}
+	}
+	// pollPINCode always owns an awaiting_pin_code activation. Rebuild the
+	// durable protocol session in place; there is no setting_pin transition to
+	// reverse at this point.
+	if errors.Is(err, gopay.ErrPINVerificationExpired) {
+		return m.recoverExpiredPINVerification(ctx, activation, client, targetPIN)
+	}
+	if errors.Is(err, gopay.ErrPINAlreadySet) {
+		return m.preparePINReset(ctx, activation, client, targetPIN)
+	}
+	if err != nil {
+		return err
 	}
 	state = client.State()
 	state.SMSCycle = activation.SMSCycle
 	client.Restore(state)
-	_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusActive, activation.BalanceRP)
+	if _, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP); err != nil {
+		return err
+	}
+	return m.publishPINSettingState(ctx, activation)
+}
+
+func (m *Manager) publishPINSettingState(ctx context.Context, activation domain.Activation) error {
+	// Schedule before publishing so the visible setting state cannot be skipped
+	// by the scheduler or lost in a crash between the two writes.
+	now := time.Now().UTC()
+	if err := m.store.TouchActivationPoll(ctx, activation.ID, activation.LeaseOwner, now, now.Add(pinStatusDisplayDuration(m.cfg.PollInterval))); err != nil {
+		return err
+	}
+	_, err := m.store.TransitionActivationOwned(ctx, activation.ID,
+		[]domain.ActivationStatus{domain.ActivationStatusAwaitingPINCode},
+		domain.ActivationStatusSettingPIN, "",
+		activation.LeaseOwner, activation.LeaseVersion)
 	return err
+}
+
+func (m *Manager) preparePINReset(ctx context.Context, activation domain.Activation, client *gopay.Client, targetPIN string) error {
+	state := client.State()
+	state.PINStage = gopay.PINStageResetReadyCycle
+	state.PINVerificationID = ""
+	state.PINOTPToken = ""
+	state.PINVerificationToken = ""
+	state.PINChallengeID = ""
+	state.PINClientID = ""
+	client.Restore(state)
+	_, err := m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
+	return err
+}
+
+func (m *Manager) recoverExpiredPINVerification(ctx context.Context, activation domain.Activation, client *gopay.Client, targetPIN string) error {
+	state := client.State()
+	if state.PINStage == gopay.PINStageResetAwaiting || state.PINStage == gopay.PINStageResetVerified {
+		state.PINStage = gopay.PINStageResetReadyCycle
+	} else {
+		state.PINStage = gopay.PINStageReadyCycle
+	}
+	state.PINVerificationID = ""
+	state.PINOTPToken = ""
+	state.PINVerificationToken = ""
+	state.PINChallengeID = ""
+	state.PINClientID = ""
+	client.Restore(state)
+	_, err := m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
+	return err
+}
+
+func (m *Manager) completePINSetting(ctx context.Context, activation domain.Activation) error {
+	batch, _, client, err := m.restoreGoPayClient(ctx, activation)
+	if err != nil {
+		return err
+	}
+	targetPIN, err := m.targetPIN(batch)
+	if err != nil {
+		return err
+	}
+	state := client.State()
+	switch state.PINStage {
+	case gopay.PINStageSetupVerified:
+		err = client.CompletePINSetup(ctx, targetPIN)
+	case gopay.PINStageResetVerified:
+		err = client.CompletePINReset(ctx, targetPIN)
+	case gopay.PINStageComplete:
+		return m.finalizePINSetting(ctx, activation)
+	default:
+		return fmt.Errorf("unexpected PIN completion stage %q", state.PINStage)
+	}
+	if isHTTPStatus(err, 401) {
+		if refreshErr := m.refreshAndPersistSession(ctx, activation, client, targetPIN, domain.AccountStatusPINPending, activation.BalanceRP); refreshErr != nil {
+			err = refreshErr
+		} else {
+			if state.PINStage == gopay.PINStageResetVerified {
+				err = client.CompletePINReset(ctx, targetPIN)
+			} else {
+				err = client.CompletePINSetup(ctx, targetPIN)
+			}
+		}
+	}
+	if errors.Is(err, gopay.ErrPINAlreadySet) {
+		if saveErr := m.preparePINReset(ctx, activation, client, targetPIN); saveErr != nil {
+			return saveErr
+		}
+		_, transitionErr := m.store.TransitionActivationOwned(ctx, activation.ID, []domain.ActivationStatus{domain.ActivationStatusSettingPIN}, domain.ActivationStatusAwaitingPINCode, "", activation.LeaseOwner, activation.LeaseVersion)
+		return transitionErr
+	}
+	if errors.Is(err, gopay.ErrPINVerificationExpired) {
+		if saveErr := m.recoverExpiredPINVerification(ctx, activation, client, targetPIN); saveErr != nil {
+			return saveErr
+		}
+		_, transitionErr := m.store.TransitionActivationOwned(ctx, activation.ID, []domain.ActivationStatus{domain.ActivationStatusSettingPIN}, domain.ActivationStatusAwaitingPINCode, "", activation.LeaseOwner, activation.LeaseVersion)
+		return transitionErr
+	}
+	if err != nil {
+		return err
+	}
+	if _, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusActive, activation.BalanceRP); err != nil {
+		return err
+	}
+	return m.finalizePINSetting(ctx, activation)
+}
+
+func (m *Manager) finalizePINSetting(ctx context.Context, activation domain.Activation) error {
+	if _, err := m.store.MarkActivationFulfilledOwned(ctx, activation.ID, activation.LeaseOwner, activation.LeaseVersion); err != nil {
+		return err
+	}
+	// Schedule the next state before publishing pin_changed. If a process stops
+	// between these writes it merely retries setting_pin later; once pin_changed
+	// is visible it remains long enough for the dashboard to observe it.
+	now := time.Now().UTC()
+	if err := m.store.TouchActivationPoll(ctx, activation.ID, activation.LeaseOwner, now, now.Add(pinStatusDisplayDuration(m.cfg.PollInterval))); err != nil {
+		return err
+	}
+	if _, err := m.store.TransitionActivationOwned(ctx, activation.ID, []domain.ActivationStatus{activation.Status}, domain.ActivationStatusPINChanged, "", activation.LeaseOwner, activation.LeaseVersion); err != nil {
+		return err
+	}
+	return nil
+}
+
+func pinStatusDisplayDuration(pollInterval time.Duration) time.Duration {
+	const minimumDisplay = 4 * time.Second
+	if pollInterval > minimumDisplay {
+		return pollInterval
+	}
+	return minimumDisplay
+}
+
+func (m *Manager) transitionToSubsequentPolling(ctx context.Context, activation domain.Activation) error {
+	if _, err := m.store.TransitionActivationOwned(ctx, activation.ID,
+		[]domain.ActivationStatus{domain.ActivationStatusPINChanged},
+		domain.ActivationStatusAwaitingSubsequentCode, "",
+		activation.LeaseOwner, activation.LeaseVersion); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	return m.store.TouchActivationPoll(ctx, activation.ID, activation.LeaseOwner, now, now)
 }
 
 func (m *Manager) pollFollowupCode(ctx context.Context, activation domain.Activation) error {
@@ -928,6 +1251,21 @@ func (m *Manager) saveSession(ctx context.Context, phone string, session gopay.S
 		CredentialsEnc: encrypted, TargetPINEnc: pinEncrypted,
 		TokenState: json.RawMessage(`{}`), DeviceState: device, Metadata: json.RawMessage(`{}`), LastLoginAt: &now,
 	})
+}
+
+func (m *Manager) refreshAndPersistSession(
+	ctx context.Context,
+	activation domain.Activation,
+	client *gopay.Client,
+	targetPIN string,
+	status domain.AccountStatus,
+	balance *float64,
+) error {
+	if err := client.Refresh(ctx); err != nil {
+		return err
+	}
+	_, err := m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, status, balance)
+	return err
 }
 
 func (m *Manager) restoreGoPayClient(ctx context.Context, activation domain.Activation) (domain.Batch, domain.Account, *gopay.Client, error) {

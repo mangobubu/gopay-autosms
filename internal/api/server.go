@@ -69,6 +69,10 @@ func (s *Server) register(group *gin.RouterGroup) {
 	group.POST("/activations/:id/success", s.markSuccess)
 	group.DELETE("/activations/:id", s.deleteActivation)
 	group.GET("/accounts", s.listAccounts)
+	group.GET("/accounts/login-status", s.listAccountLoginStatuses)
+	group.GET("/accounts/login-statuses", s.listAccountLoginStatuses)
+	group.POST("/accounts/login-status/refresh", s.refreshAccountLoginStatuses)
+	group.GET("/accounts/:id/login-status", s.getAccountLoginStatus)
 	group.GET("/dashboard", s.dashboard)
 }
 
@@ -339,6 +343,60 @@ func (s *Server) listAccounts(c *gin.Context) {
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"accounts": public})
+}
+
+// listAccountLoginStatuses returns the latest local snapshot and performs a
+// throttled, signed GoPay profile probe when the snapshot has expired. Tokens
+// and encrypted credentials are deliberately omitted from this response.
+func (s *Server) listAccountLoginStatuses(c *gin.Context) {
+	views, err := s.workflow.ListAccountLoginStatuses(c.Request.Context())
+	if err != nil {
+		respondLoginStatusError(c, err)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{"accounts": views})
+}
+
+func (s *Server) refreshAccountLoginStatuses(c *gin.Context) {
+	views, err := s.workflow.RefreshAccountLoginStatuses(c.Request.Context())
+	if err != nil {
+		respondLoginStatusError(c, err)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{"accounts": views})
+}
+
+func (s *Server) getAccountLoginStatus(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	view, err := s.workflow.GetAccountLoginStatus(c.Request.Context(), id)
+	if err != nil {
+		respondLoginStatusError(c, err)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, view)
+}
+
+func respondLoginStatusError(c *gin.Context, err error) {
+	status := http.StatusInternalServerError
+	message := "登录状态读取失败，请稍后重试"
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		status = http.StatusNotFound
+		message = "GoPay 账号不存在"
+	case errors.Is(err, storage.ErrInvalidInput):
+		status = http.StatusBadRequest
+		message = "GoPay 账号参数无效"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		status = http.StatusGatewayTimeout
+		message = "登录状态检查超时，请稍后重试"
+	}
+	c.JSON(status, gin.H{"error": message})
 }
 
 func (s *Server) dashboard(c *gin.Context) {

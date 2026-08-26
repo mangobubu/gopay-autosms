@@ -182,6 +182,14 @@ func (c *Client) StartNextLoginOTP(ctx context.Context) (OTPChallenge, error) {
 func (c *Client) Refresh(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.refreshLocked(ctx)
+}
+
+// refreshLocked exchanges the persisted refresh token for a fresh access
+// token. The caller must hold c.mu. Keeping the operation in a lock-aware
+// helper lets login-status probing refresh and retry atomically without
+// racing another request for the same account.
+func (c *Client) refreshLocked(ctx context.Context) error {
 	if c.session.RefreshToken == "" {
 		return fmt.Errorf("%w: refresh token is missing", ErrInvalidState)
 	}

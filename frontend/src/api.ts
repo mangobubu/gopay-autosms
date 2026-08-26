@@ -69,6 +69,82 @@ function withQuery(path: string, params: Record<string, string | number | undefi
   return suffix ? `${path}?${suffix}` : path
 }
 
+export function validateAccountLoginStatusesPayload(payload: unknown): unknown {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new ApiError('GoPay 登录状态响应格式异常', 502, payload)
+  }
+  const accounts = (payload as Record<string, unknown>).accounts
+  if (!Array.isArray(accounts)) {
+    throw new ApiError('GoPay 登录状态响应格式异常', 502, payload)
+  }
+
+  const allowedStates = new Set(['valid', 'invalid', 'unknown', 'checking'])
+  const seenIDs = new Set<string>()
+  const statusValue = (value: unknown): string | undefined => {
+    if (typeof value !== 'string') return undefined
+    const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, '_')
+    return normalized || undefined
+  }
+  const accountID = (value: unknown): string | undefined => {
+    if (typeof value === 'number') {
+      if (!Number.isSafeInteger(value) || value <= 0) return undefined
+      return String(value)
+    }
+    if (typeof value !== 'string') return undefined
+    const normalized = value.trim()
+    if (!/^[1-9]\d*$/.test(normalized)) return undefined
+    const parsed = Number(normalized)
+    if (!Number.isSafeInteger(parsed) || parsed <= 0) return undefined
+    return String(parsed)
+  }
+  const validAccount = accounts.every((account) => {
+    if (!account || typeof account !== 'object' || Array.isArray(account)) return false
+    const record = account as Record<string, unknown>
+    const id = accountID(record.id ?? record.account_id ?? record.accountId)
+    if (!id || seenIDs.has(id)) return false
+    seenIDs.add(id)
+
+    const phone = record.phone_number ?? record.phoneNumber ?? record.phone
+    if (typeof phone !== 'string' || phone.trim() === '') return false
+
+    const loginStatus = statusValue(record.login_status ?? record.loginStatus)
+    const stateAlias = statusValue(record.status ?? record.state)
+    if ((!loginStatus && !stateAlias)
+      || (loginStatus && !allowedStates.has(loginStatus))
+      || (stateAlias && !allowedStates.has(stateAlias))) return false
+    if (loginStatus && stateAlias && loginStatus !== stateAlias) return false
+
+    if ('valid' in record
+      && typeof record.valid !== 'boolean') return false
+    if ('is_valid' in record
+      && typeof record.is_valid !== 'boolean') return false
+    if ('isValid' in record
+      && typeof record.isValid !== 'boolean') return false
+    const valid = record.valid ?? record.is_valid ?? record.isValid
+    const effectiveStatus = loginStatus ?? stateAlias
+    if (typeof valid === 'boolean'
+      && ((effectiveStatus === 'valid') !== valid)
+      && effectiveStatus !== 'checking') return false
+
+    if ('checked_at' in record && (typeof record.checked_at !== 'string'
+      || !Number.isFinite(Date.parse(record.checked_at)))) return false
+    if ('checkedAt' in record && (typeof record.checkedAt !== 'string'
+      || !Number.isFinite(Date.parse(record.checkedAt)))) return false
+    const messageFields = ['error', 'message', 'detail']
+    if (messageFields.some((field) => field in record
+      && record[field] !== undefined
+      && typeof record[field] !== 'string')) return false
+    if ('refreshed' in record && typeof record.refreshed !== 'boolean') return false
+    if ('was_refreshed' in record && typeof record.was_refreshed !== 'boolean') return false
+    if ('wasRefreshed' in record && typeof record.wasRefreshed !== 'boolean') return false
+    return true
+  })
+  if (!validAccount) {
+    throw new ApiError('GoPay 登录状态响应格式异常', 502, payload)
+  }
+  return payload
+}
+
 export const api = {
   getSettings: () => request<unknown>('/api/settings/smsbower'),
 
@@ -86,7 +162,9 @@ export const api = {
     request<unknown>(withQuery('/api/catalog/countries', { service })),
 
   getPrices: (service: string, country: string) =>
-    request<unknown>(withQuery('/api/catalog/prices', { service, country })),
+    request<unknown>(withQuery('/api/catalog/prices', { service, country }), {
+      cache: 'no-store',
+    }),
 
   createBatch: (batch: BatchRequest) =>
     request<unknown>('/api/batches', {
@@ -98,6 +176,19 @@ export const api = {
 
   getActivations: (batchId?: string) =>
     request<unknown>(withQuery('/api/activations', { batch_id: batchId })),
+
+  getAccountLoginStatuses: async (signal?: AbortSignal) =>
+    validateAccountLoginStatusesPayload(await request<unknown>('/api/accounts/login-status', {
+      cache: 'no-store',
+      signal,
+    })),
+
+  refreshAccountLoginStatuses: async (signal?: AbortSignal) =>
+    validateAccountLoginStatusesPayload(await request<unknown>('/api/accounts/login-status/refresh', {
+      method: 'POST',
+      cache: 'no-store',
+      signal,
+    })),
 
   markSuccess: (id: string) =>
     request<unknown>(`/api/activations/${encodeURIComponent(id)}/success`, {

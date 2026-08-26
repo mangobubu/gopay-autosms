@@ -2,6 +2,7 @@ package smsbower
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -114,7 +115,7 @@ func TestGetStatusVariants(t *testing.T) {
 func TestCatalogParsing(t *testing.T) {
 	responses := map[string]string{
 		"getServicesList": `{"status":"success","services":[{"code":"ni","name":"GoPay"},{"code":"kt","name":"KakaoTalk"}]}`,
-		"getCountries":    `{"countries":[{"id":6,"rus":"Индонезия","eng":"Indonesia","chn":"印度尼西亚"},{"id":"1003","eng":"Bermuda"}]}`,
+		"getCountries":    `{"countries":[{"id":6,"rus":"Индонезия","eng":"Indonesia","chn":"印度尼西亚","iso":" id "},{"id":"1003","eng":"Bermuda","countryCode":"BM"},{"id":999,"eng":"Example","countryCode":"62"}]}`,
 		"getPricesV3":     `{"6":{"ni":{"17":{"count":4,"price":"1.25","provider_id":17},"23":{"count":"2","price":1.5,"providerId":"23"}}}}`,
 	}
 	client, _ := testClient(t, func(values url.Values) string { return responses[values.Get("action")] })
@@ -130,8 +131,11 @@ func TestCatalogParsing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetCountries() error = %v", err)
 	}
-	if len(countries) != 2 || countries[0].ID != 6 || countries[0].Name != "Indonesia" || countries[1].ID != 1003 {
+	if len(countries) != 3 || countries[0].ID != 6 || countries[0].Name != "Indonesia" || countries[2].ID != 1003 {
 		t.Errorf("countries = %#v", countries)
+	}
+	if countries[0].ISOCode != "ID" || countries[1].ISOCode != "" || countries[2].ISOCode != "BM" {
+		t.Errorf("country ISO codes = %q, %q, %q", countries[0].ISOCode, countries[1].ISOCode, countries[2].ISOCode)
 	}
 	prices, err := client.GetPrices(context.Background(), PriceRequest{
 		Service: "ni", Country: 6, MinPrice: "1.25", MaxPrice: "1.50", ProviderIDs: []int64{17, 23},
@@ -144,6 +148,64 @@ func TestCatalogParsing(t *testing.T) {
 	}
 	if prices[0].Country != 6 || prices[0].Service != "ni" || prices[0].ProviderID != 17 || prices[0].Price != "1.25" || prices[0].Count != 4 {
 		t.Errorf("prices[0] = %#v", prices[0])
+	}
+}
+
+func TestCountryISOCodeFallback(t *testing.T) {
+	if len(countryISOByID) != 205 {
+		t.Fatalf("country ISO catalogue has %d entries, want 205", len(countryISOByID))
+	}
+	tests := map[int]string{
+		4: "PH", 6: "ID", 12: "US", 16: "GB", 18: "CD",
+		139: "NE", 150: "CG", 187: "US", 203: "XK", 204: "NU",
+	}
+	for id, want := range tests {
+		if got := countryISOCode(id); got != want {
+			t.Errorf("countryISOCode(%d) = %q, want %q", id, got, want)
+		}
+	}
+	for _, id := range []int{-1, 205, 360, 999} {
+		if got := countryISOCode(id); got != "" {
+			t.Errorf("countryISOCode(%d) = %q, want empty", id, got)
+		}
+	}
+}
+
+func TestParseCountriesAddsISOFromProviderID(t *testing.T) {
+	countries, err := parseCountries("getCountries", []byte(`{
+		"countries": [
+			{"id": 12, "eng": "USA (virtual)"},
+			{"id": 18, "eng": "Congo (Dem. Republic)"},
+			{"id": 204, "eng": "Niue"}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("parseCountries() error = %v", err)
+	}
+	want := []string{"US", "CD", "NU"}
+	for index, country := range countries {
+		if country.ISOCode != want[index] {
+			t.Errorf("countries[%d].ISOCode = %q, want %q", index, country.ISOCode, want[index])
+		}
+	}
+}
+
+func TestParseCountriesAcceptsISOAliasesAndRejectsCallingCodes(t *testing.T) {
+	countries, err := parseCountries("getCountries", []byte(`{
+		"countries": [
+			{"id": 998, "eng": "Code alias", "code": " zz "},
+			{"id": 999, "eng": "Country alias", "country": "PH"},
+			{"id": 1000, "eng": "Calling code", "countryCode": "62"}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("parseCountries() error = %v", err)
+	}
+	want := []string{"ZZ", "PH", ""}
+	for index, country := range countries {
+		if country.ISOCode != want[index] {
+			t.Errorf("countries[%d].ISOCode = %q, want %q", index, country.ISOCode, want[index])
+		}
 	}
 }
 
@@ -214,6 +276,94 @@ func TestGetPricesV2IntegerPriceAndUnknownJSONFallback(t *testing.T) {
 			t.Fatalf("request count = %d, want 3", len(*requests))
 		}
 	})
+}
+
+func TestGetPricesParsesProviderTiersAndSortsByNumericPrice(t *testing.T) {
+	client, _ := testClient(t, func(values url.Values) string {
+		if values.Get("action") != "getPricesV3" {
+			t.Fatalf("action = %q, want getPricesV3", values.Get("action"))
+		}
+		return `{
+			"6": {
+				"Bronze": {
+					"ni": {
+						"5": {"count": 2, "price": "2", "provider_id": 5}
+					}
+				},
+				"ni": {
+					"Gold": {
+						"7": {"count": 1, "price": "10", "provider_id": 7, "rank": 1}
+					},
+					"3": {"count": 3, "price": "1,25", "provider_id": 3, "level": "SILVER"}
+				}
+			}
+		}`
+	})
+
+	prices, err := client.GetPrices(context.Background(), PriceRequest{Service: "ni", Country: 6})
+	if err != nil {
+		t.Fatalf("GetPrices() error = %v", err)
+	}
+	if len(prices) != 3 {
+		t.Fatalf("prices = %#v", prices)
+	}
+	wantPrices := []string{"1,25", "2", "10"}
+	wantProviders := []int64{3, 5, 7}
+	wantTiers := []string{"Silver", "Bronze", "Gold"}
+	for index := range prices {
+		if prices[index].Price != wantPrices[index] || prices[index].ProviderID != wantProviders[index] || prices[index].Tier != wantTiers[index] {
+			t.Errorf("prices[%d] = %#v, want price=%q provider=%d tier=%q", index, prices[index], wantPrices[index], wantProviders[index], wantTiers[index])
+		}
+	}
+
+	encoded, err := json.Marshal(prices)
+	if err != nil {
+		t.Fatalf("json.Marshal(prices) error = %v", err)
+	}
+	for _, tier := range wantTiers {
+		if !strings.Contains(string(encoded), `"tier":"`+tier+`"`) {
+			t.Errorf("JSON %s does not expose tier %q", encoded, tier)
+		}
+	}
+}
+
+func TestParsePricesSortsUnknownPricesAfterNumericPrices(t *testing.T) {
+	prices, err := parsePrices("getPricesV3", []byte(`{
+		"6": {
+			"ni": {
+				"3": {"price": "unknown", "count": 1, "provider_id": 3},
+				"2": {"price": "10", "count": 1, "provider_id": 2},
+				"1": {"price": "2", "count": 1, "provider_id": 1}
+			}
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("parsePrices() error = %v", err)
+	}
+	if got := []string{prices[0].Price, prices[1].Price, prices[2].Price}; !slices.Equal(got, []string{"2", "10", "unknown"}) {
+		t.Fatalf("price order = %v, want numeric prices first from low to high", got)
+	}
+}
+
+func TestParsePricesAcceptsNumericAndObjectProviderRanks(t *testing.T) {
+	prices, err := parsePrices("getPricesV3", []byte(`{
+		"6": {
+			"ni": {
+				"101": {"price": "1", "count": 1, "provider_id": 101, "rank": 1},
+				"102": {"price": "2", "count": 1, "provider_id": 102, "tier": "", "provider_rank": {"id": "2"}},
+				"103": {"price": "3", "count": 1, "provider_id": 103, "tier": null, "rank": {"id": 3, "description": "bronze"}}
+			}
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("parsePrices() error = %v", err)
+	}
+	if len(prices) != 3 {
+		t.Fatalf("prices = %#v, want 3 provider-ranked offers", prices)
+	}
+	if got := []string{prices[0].Tier, prices[1].Tier, prices[2].Tier}; !slices.Equal(got, []string{"Gold", "Silver", "Bronze"}) {
+		t.Fatalf("provider tiers = %v, want numeric/object ranks normalized", got)
+	}
 }
 
 func TestProviderErrorsAndSetStatus(t *testing.T) {

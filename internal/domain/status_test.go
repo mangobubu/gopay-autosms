@@ -56,9 +56,24 @@ func TestTerminalStatuses(t *testing.T) {
 		ActivationStatusPINRequired,
 		ActivationStatusUnregistered,
 		ActivationStatusZeroBalanceUsed,
+		ActivationStatusSettingPIN,
+		ActivationStatusPINChanged,
+		ActivationStatusAwaitingSubsequentCode,
 	} {
 		if status.Terminal() {
 			t.Fatalf("%q must stay recoverable until remote finalization succeeds", status)
+		}
+	}
+}
+
+func TestPINWorkflowStatusesAreValid(t *testing.T) {
+	for _, status := range []ActivationStatus{
+		ActivationStatusSettingPIN,
+		ActivationStatusPINChanged,
+		ActivationStatusAwaitingSubsequentCode,
+	} {
+		if !status.Valid() {
+			t.Fatalf("%q should be valid", status)
 		}
 	}
 }

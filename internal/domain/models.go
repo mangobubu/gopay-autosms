@@ -50,21 +50,23 @@ type Batch struct {
 type ActivationStatus string
 
 const (
-	ActivationStatusPurchased         ActivationStatus = "purchased"
-	ActivationStatusDuplicate         ActivationStatus = "duplicate"
-	ActivationStatusAwaitingLoginCode ActivationStatus = "awaiting_login_code"
-	ActivationStatusLoggingIn         ActivationStatus = "logging_in"
-	ActivationStatusPINRequired       ActivationStatus = "pin_required"
-	ActivationStatusUnregistered      ActivationStatus = "unregistered"
-	ActivationStatusCheckingBalance   ActivationStatus = "checking_balance"
-	ActivationStatusZeroBalanceUsed   ActivationStatus = "zero_balance_used"
-	ActivationStatusSettingPIN        ActivationStatus = "setting_pin"
-	ActivationStatusAwaitingPINCode   ActivationStatus = "awaiting_pin_code"
-	ActivationStatusActive            ActivationStatus = "active"
-	ActivationStatusSuccess           ActivationStatus = "success"
-	ActivationStatusExpired           ActivationStatus = "expired"
-	ActivationStatusCancelled         ActivationStatus = "cancelled"
-	ActivationStatusFailed            ActivationStatus = "failed"
+	ActivationStatusPurchased              ActivationStatus = "purchased"
+	ActivationStatusDuplicate              ActivationStatus = "duplicate"
+	ActivationStatusAwaitingLoginCode      ActivationStatus = "awaiting_login_code"
+	ActivationStatusLoggingIn              ActivationStatus = "logging_in"
+	ActivationStatusPINRequired            ActivationStatus = "pin_required"
+	ActivationStatusUnregistered           ActivationStatus = "unregistered"
+	ActivationStatusCheckingBalance        ActivationStatus = "checking_balance"
+	ActivationStatusZeroBalanceUsed        ActivationStatus = "zero_balance_used"
+	ActivationStatusSettingPIN             ActivationStatus = "setting_pin"
+	ActivationStatusAwaitingPINCode        ActivationStatus = "awaiting_pin_code"
+	ActivationStatusPINChanged             ActivationStatus = "pin_changed"
+	ActivationStatusAwaitingSubsequentCode ActivationStatus = "awaiting_subsequent_code"
+	ActivationStatusActive                 ActivationStatus = "active"
+	ActivationStatusSuccess                ActivationStatus = "success"
+	ActivationStatusExpired                ActivationStatus = "expired"
+	ActivationStatusCancelled              ActivationStatus = "cancelled"
+	ActivationStatusFailed                 ActivationStatus = "failed"
 )
 
 // ControlAction is a durable user action consumed by a worker. Delete is the

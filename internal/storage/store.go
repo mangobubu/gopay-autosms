@@ -12,6 +12,7 @@ import (
 var (
 	ErrNotFound      = errors.New("storage: not found")
 	ErrConflict      = errors.New("storage: state conflict")
+	ErrRetryable     = errors.New("storage: retryable transaction failure")
 	ErrBatchCapacity = errors.New("storage: batch quantity already reserved")
 	ErrInvalidInput  = errors.New("storage: invalid input")
 	ErrCommitUnknown = errors.New("storage: transaction commit outcome unknown")
@@ -168,4 +169,26 @@ type AccountStore interface {
 	GetAccountByPhone(context.Context, string) (domain.Account, error)
 	ListAccounts(context.Context, AccountFilter) ([]domain.Account, error)
 	UpdateAccountStatus(context.Context, int64, domain.AccountStatus) error
+}
+
+// AccountCredentialCASStore is an optional capability used when an operation
+// rotates GoPay credentials outside the main account workflow. It deliberately
+// is not embedded in Store so lightweight stores remain source compatible.
+// Implementations must update only when the encrypted session still matches
+// expectedCredentialsEnc, returning ErrConflict when another writer won.
+type AccountCredentialCASStore interface {
+	UpdateAccountCredentialsIfUnchanged(
+		context.Context,
+		int64,
+		[]byte,
+		[]byte,
+		json.RawMessage,
+	) error
+}
+
+// AccountSessionLockStore serializes remote session mutation and its durable
+// write across service instances. The returned release function must always be
+// called; implementations should make it idempotent.
+type AccountSessionLockStore interface {
+	AcquireAccountSessionLock(context.Context, string) (func(context.Context) error, error)
 }

@@ -2,12 +2,20 @@
 import { computed } from 'vue'
 import { ElMessage } from 'element-plus'
 
-import { activationStatus, formatNumber, formatTime } from '../normalizers'
-import type { ActivationView } from '../types'
+import {
+  accountLoginStatus,
+  activationStatus,
+  formatCountdown,
+  formatNumber,
+  formatTime,
+} from '../normalizers'
+import type { ActivationView, GoPayLoginStatusView } from '../types'
 
 const props = defineProps<{
   activation: ActivationView
+  loginStatus?: GoPayLoginStatusView
   busy?: boolean
+  nowMs?: number
 }>()
 
 const emit = defineEmits<{
@@ -16,8 +24,12 @@ const emit = defineEmits<{
 }>()
 
 const meta = computed(() => activationStatus(props.activation.status))
-const canOperate = computed(() => !props.activation.finishedAt && ['polling', 'active'].includes(props.activation.status))
-const isPolling = computed(() => !props.activation.finishedAt && ['polling', 'active'].includes(props.activation.status))
+const loginMeta = computed(() => (
+  props.loginStatus ? accountLoginStatus(props.loginStatus.status) : undefined
+))
+const canOperate = computed(() => !props.activation.finishedAt && ['polling', 'active', 'awaiting_subsequent_code'].includes(props.activation.status))
+const isPolling = computed(() => !props.activation.finishedAt && ['polling', 'active', 'awaiting_subsequent_code', 'pin_changed'].includes(props.activation.status))
+const countdown = computed(() => formatCountdown(props.activation.expiresAt, props.nowMs))
 
 async function copyPhone(): Promise<void> {
   if (!props.activation.phone || props.activation.phone === '—') return
@@ -41,10 +53,30 @@ async function copyPhone(): Promise<void> {
         </button>
       </div>
 
-      <el-tag :type="meta.type" effect="light" round>
-        <span v-if="meta.active" class="status-pulse" aria-hidden="true" />
-        {{ meta.label }}
-      </el-tag>
+      <div class="activation-card__status-stack">
+        <el-tag :type="meta.type" effect="light" round>
+          <span v-if="meta.active" class="status-pulse" aria-hidden="true" />
+          {{ meta.label }}
+        </el-tag>
+
+        <div
+          v-if="loginStatus && loginMeta"
+          class="activation-login-status"
+          :class="`is-${loginStatus.status}`"
+          :title="loginStatus.message"
+          role="status"
+          aria-live="polite"
+        >
+          <div class="activation-login-status__primary">
+            <span class="activation-login-status__dot" aria-hidden="true" />
+            <span>GoPay · {{ loginMeta.label }}</span>
+          </div>
+          <small v-if="loginStatus.checkedAt">
+            最近检查 {{ formatTime(loginStatus.checkedAt) }}
+          </small>
+          <small v-if="loginStatus.refreshed">已自动刷新登录凭据</small>
+        </div>
+      </div>
     </header>
 
     <div class="activation-card__meta">
@@ -61,6 +93,7 @@ async function copyPhone(): Promise<void> {
       <div>
         <span>到期时间</span>
         <strong>{{ formatTime(activation.expiresAt) }}</strong>
+        <small v-if="countdown !== '—'" class="activation-countdown">倒计时 {{ countdown }}</small>
       </div>
     </div>
 

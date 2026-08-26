@@ -47,7 +47,8 @@ func main() {
 	settingsManager := appsettings.New(store, box, cfg.SMSBaseURL)
 	workflowManager := workflow.New(store, settingsManager, box, workflow.Config{
 		PollInterval: cfg.PollInterval, ActivationTTL: cfg.ActivationTTL,
-		SSOBaseURL: cfg.GoPaySSOBaseURL, GoPayBaseURL: cfg.GoPayBaseURL,
+		LoginStatusTTL: cfg.LoginStatusTTL,
+		SSOBaseURL:     cfg.GoPaySSOBaseURL, GoPayBaseURL: cfg.GoPayBaseURL,
 	}, logger)
 	workflowManager.Run(ctx)
 

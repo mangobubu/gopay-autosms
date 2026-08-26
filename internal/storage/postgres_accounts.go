@@ -155,3 +155,45 @@ func (s *PostgresStore) UpdateAccountStatus(ctx context.Context, id int64, statu
 	}
 	return nil
 }
+
+var _ AccountCredentialCASStore = (*PostgresStore)(nil)
+
+// UpdateAccountCredentialsIfUnchanged persists a rotated GoPay session without
+// replacing the account's business status, balance, PIN ciphertext, or
+// metadata. The old ciphertext is an optimistic version: a worker that saved a
+// newer session wins instead of being overwritten by a stale status probe.
+func (s *PostgresStore) UpdateAccountCredentialsIfUnchanged(
+	ctx context.Context,
+	id int64,
+	expectedCredentialsEnc []byte,
+	nextCredentialsEnc []byte,
+	deviceState json.RawMessage,
+) error {
+	if id <= 0 || len(expectedCredentialsEnc) == 0 || len(nextCredentialsEnc) == 0 {
+		return ErrInvalidInput
+	}
+	device := validJSONOrObject(deviceState)
+	if !json.Valid(device) {
+		return fmt.Errorf("%w: malformed device JSON", ErrInvalidInput)
+	}
+	result, err := s.pool.Exec(ctx, `
+		UPDATE accounts
+		SET credentials_enc=$3, device_state=$4::jsonb, updated_at=now()
+		WHERE id=$1 AND credentials_enc=$2`,
+		id, expectedCredentialsEnc, nextCredentialsEnc, device,
+	)
+	if err != nil {
+		return mapError(err)
+	}
+	if result.RowsAffected() == 0 {
+		var exists bool
+		if err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1)`, id).Scan(&exists); err != nil {
+			return mapError(err)
+		}
+		if !exists {
+			return ErrNotFound
+		}
+		return ErrConflict
+	}
+	return nil
+}

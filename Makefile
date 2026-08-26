@@ -9,6 +9,7 @@ build: frontend
 	$(GO) build -trimpath -o bin/autosms ./cmd/autosms
 
 test: frontend
+	cd frontend && $(NPM) test
 	$(GO) test ./...
 
 frontend-install:

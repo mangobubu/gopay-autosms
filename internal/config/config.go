@@ -24,6 +24,7 @@ type Config struct {
 	GoPaySSOBaseURL   string
 	GoPayBaseURL      string
 	PollInterval      time.Duration
+	LoginStatusTTL    time.Duration
 	ActivationTTL     time.Duration
 	PurchaseRetryWait time.Duration
 	MaxBatchAttempts  int
@@ -39,6 +40,7 @@ func Load() Config {
 		GoPaySSOBaseURL:   envString("AUTOSMS_GOPAY_SSO_BASE_URL", "https://accounts.goto-products.com"),
 		GoPayBaseURL:      envString("AUTOSMS_GOPAY_BASE_URL", "https://customer.gopayapi.com"),
 		PollInterval:      envDuration("AUTOSMS_POLL_INTERVAL", 2*time.Second),
+		LoginStatusTTL:    envDuration("AUTOSMS_GOPAY_LOGIN_STATUS_TTL", 4*time.Second),
 		ActivationTTL:     envDuration("AUTOSMS_ACTIVATION_TTL", 20*time.Minute),
 		PurchaseRetryWait: envDuration("AUTOSMS_PURCHASE_RETRY_WAIT", 2*time.Second),
 		MaxBatchAttempts:  envInt("AUTOSMS_MAX_BATCH_ATTEMPTS", 100),
