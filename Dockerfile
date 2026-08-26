@@ -30,7 +30,8 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=backend-builder /out/autosms /app/autosms
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod 0755 /app/autosms /app/docker-entrypoint.sh \
+RUN sed -i 's/\r$//' /app/docker-entrypoint.sh \
+    && chmod 0755 /app/autosms /app/docker-entrypoint.sh \
     && mkdir -p /data \
     && chown -R postgres:postgres /data
 
