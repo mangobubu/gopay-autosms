@@ -1,0 +1,9 @@
+.DS_Store
+.env
+*.log
+coverage.out
+bin/
+frontend/node_modules/
+frontend/dist/
+data/
+postgres-data/

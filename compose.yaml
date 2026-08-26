@@ -1,0 +1,16 @@
+services:
+  autosms:
+    build:
+      context: .
+    container_name: autosms
+    environment:
+      AUTOSMS_PUBLIC_URL: "http://localhost:${AUTOSMS_PORT:-8080}"
+    ports:
+      - "127.0.0.1:${AUTOSMS_PORT:-8080}:8080"
+    volumes:
+      - autosms-data:/data
+    restart: unless-stopped
+    stop_grace_period: 45s
+
+volumes:
+  autosms-data:

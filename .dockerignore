@@ -1,0 +1,12 @@
+.git
+.gitignore
+.DS_Store
+.env
+.env.*
+*.log
+coverage.out
+bin
+data
+postgres-data
+frontend/node_modules
+internal/webui/dist
