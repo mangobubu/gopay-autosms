@@ -55,6 +55,7 @@ func TestTerminalStatuses(t *testing.T) {
 		ActivationStatusDuplicate,
 		ActivationStatusPINRequired,
 		ActivationStatusUnregistered,
+		ActivationStatusLoginFailed,
 		ActivationStatusZeroBalanceUsed,
 		ActivationStatusSettingPIN,
 		ActivationStatusPINChanged,

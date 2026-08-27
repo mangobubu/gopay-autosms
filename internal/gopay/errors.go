@@ -13,6 +13,10 @@ var (
 	ErrPINRequired = errors.New("gopay: existing PIN is required")
 	// ErrUnregistered means the phone number is not registered with GoPay.
 	ErrUnregistered = errors.New("gopay: phone number is not registered")
+	// ErrLoginFailed marks an explicit account-level login rejection. It is
+	// deliberately narrower than a generic HTTP 403/429: callers should only
+	// use it when GoPay returns one of the structured terminal error codes.
+	ErrLoginFailed = errors.New("gopay: login failed")
 	// ErrBalanceUnknown is returned when a successful balance response does not
 	// contain a trustworthy numeric value. Callers must not treat it as zero.
 	ErrBalanceUnknown = errors.New("gopay: balance is unknown")
@@ -34,6 +38,9 @@ var (
 func classifyPINError(err error) error {
 	if err == nil {
 		return nil
+	}
+	if loginFailureError(err) {
+		return fmt.Errorf("%w: %w", ErrLoginFailed, err)
 	}
 	var httpErr *HTTPError
 	if !errors.As(err, &httpErr) {

@@ -19,6 +19,36 @@ const activationColumns = `id, batch_id, account_id, provider, provider_activati
 	lease_until, lease_version, control_action, provider_payload, provider_expires_at,
 	last_polled_at, hidden_at, created_at, updated_at, finished_at`
 
+const providerActivationLockSQL = `SELECT pg_advisory_xact_lock(hashtextextended($1, 1))`
+
+const recordBatchPurchaseSQL = `UPDATE batches SET
+	purchase_reserved_count=purchase_reserved_count-1,
+	purchased_count=purchased_count+1,
+	inflight_count=inflight_count+1,
+	status=CASE WHEN status IN ('pending','running') THEN 'running' ELSE status END,
+	started_at=COALESCE(started_at, now()),
+	updated_at=now()
+	WHERE id=$1
+		AND purchase_reserved_count > 0
+		AND purchased_count < quantity`
+
+const releaseBatchSlotSQL = `UPDATE batches SET
+	fulfilled_count=fulfilled_count+CASE WHEN $2::boolean THEN 1 ELSE 0 END,
+	inflight_count=GREATEST(inflight_count-1, 0),
+	updated_at=now()
+	WHERE id=$1 AND (NOT $2::boolean OR fulfilled_count < quantity)`
+
+func lockProviderActivation(ctx context.Context, tx pgx.Tx, provider, providerID string) error {
+	// Use a length-prefixed key and a namespace seed distinct from phone
+	// fingerprints. The same lock is taken by persistence and failure
+	// resolution, so a no-row observation cannot race an uncommitted insert.
+	key := strconv.Itoa(len(provider)) + ":" + provider + providerID
+	if _, err := tx.Exec(ctx, providerActivationLockSQL, key); err != nil {
+		return mapError(err)
+	}
+	return nil
+}
+
 func scanActivation(row rowScanner) (domain.Activation, error) {
 	var activation domain.Activation
 	var accountID sql.NullInt64
@@ -75,6 +105,7 @@ func (s *PostgresStore) CreateActivationAtomically(
 	ctx context.Context,
 	params CreateActivationParams,
 ) (CreateActivationResult, error) {
+	params.PurchaseToken = strings.TrimSpace(params.PurchaseToken)
 	normalized, err := domain.NormalizePhone(params.PhoneNumber)
 	if err != nil {
 		return CreateActivationResult{}, ErrInvalidInput
@@ -84,7 +115,7 @@ func (s *PostgresStore) CreateActivationAtomically(
 	params.ServiceCode = strings.TrimSpace(params.ServiceCode)
 	params.CountryCode = strings.TrimSpace(params.CountryCode)
 	params.PurchasePriceAmount = strings.TrimSpace(params.PurchasePriceAmount)
-	if params.BatchID <= 0 || params.Provider == "" || params.ProviderActivationID == "" ||
+	if params.PurchaseToken == "" || params.BatchID <= 0 || params.Provider == "" || params.ProviderActivationID == "" ||
 		params.ServiceCode == "" || params.CountryCode == "" || params.PurchasePriceAmount == "" {
 		return CreateActivationResult{}, ErrInvalidInput
 	}
@@ -100,36 +131,68 @@ func (s *PostgresStore) CreateActivationAtomically(
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Provider retries are idempotent even after the batch reaches capacity.
-	existing, scanErr := scanActivation(tx.QueryRow(ctx,
-		`SELECT `+activationColumns+` FROM activations WHERE provider=$1 AND provider_activation_id=$2`,
-		params.Provider, params.ProviderActivationID,
-	))
-	if scanErr == nil {
-		expectedFingerprint := domain.PhoneFingerprint(normalized)
-		if existing.BatchID != params.BatchID || existing.PhoneFingerprint != expectedFingerprint ||
-			existing.ServiceCode != params.ServiceCode || existing.CountryCode != params.CountryCode {
-			return CreateActivationResult{}, ErrConflict
-		}
-		if err = tx.Commit(ctx); err != nil {
-			return CreateActivationResult{}, fmt.Errorf("commit idempotent activation: %w", err)
-		}
-		return CreateActivationResult{Activation: existing, Duplicate: existing.Status == domain.ActivationStatusDuplicate}, nil
-	}
-	if scanErr != pgx.ErrNoRows {
-		return CreateActivationResult{}, mapError(scanErr)
-	}
-
-	var quantity, fulfilled, inflight int
+	// Every quota-changing transaction locks the batch before its attempt or
+	// activation rows. This matches cancellation and worker finalization.
+	var quantity, purchased, reserved int
 	var batchStatus string
-	err = tx.QueryRow(ctx, `SELECT quantity, fulfilled_count, inflight_count, status
+	err = tx.QueryRow(ctx, `SELECT quantity, purchased_count, purchase_reserved_count, status
 		FROM batches WHERE id=$1 FOR UPDATE`, params.BatchID).
-		Scan(&quantity, &fulfilled, &inflight, &batchStatus)
+		Scan(&quantity, &purchased, &reserved, &batchStatus)
 	if err != nil {
 		return CreateActivationResult{}, mapError(err)
 	}
-	if fulfilled+inflight >= quantity || domain.BatchStatus(batchStatus).Terminal() {
+
+	var attemptBatchID int64
+	var attemptState string
+	var committedActivationID sql.NullInt64
+	err = tx.QueryRow(ctx, `SELECT batch_id, state, activation_id
+		FROM batch_purchase_attempts WHERE token=$1 FOR UPDATE`, params.PurchaseToken).
+		Scan(&attemptBatchID, &attemptState, &committedActivationID)
+	if err != nil {
+		return CreateActivationResult{}, mapError(err)
+	}
+	if attemptBatchID != params.BatchID {
+		return CreateActivationResult{}, ErrConflict
+	}
+	if attemptState == "committed" {
+		if !committedActivationID.Valid {
+			return CreateActivationResult{}, ErrConflict
+		}
+		existing, scanErr := scanActivation(tx.QueryRow(ctx,
+			`SELECT `+activationColumns+` FROM activations WHERE id=$1`, committedActivationID.Int64,
+		))
+		if scanErr != nil {
+			return CreateActivationResult{}, mapError(scanErr)
+		}
+		expectedFingerprint := domain.PhoneFingerprint(normalized)
+		if existing.BatchID != params.BatchID || existing.PhoneFingerprint != expectedFingerprint ||
+			existing.ServiceCode != params.ServiceCode || existing.CountryCode != params.CountryCode ||
+			existing.Provider != params.Provider || existing.ProviderActivationID != params.ProviderActivationID {
+			return CreateActivationResult{}, ErrConflict
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return CreateActivationResult{}, fmt.Errorf("%w: commit idempotent activation: %v", ErrCommitUnknown, err)
+		}
+		return CreateActivationResult{Activation: existing, Duplicate: existing.Status == domain.ActivationStatusDuplicate}, nil
+	}
+	if attemptState != string(PurchaseAttemptSent) {
+		return CreateActivationResult{}, ErrConflict
+	}
+	if purchased >= quantity || reserved <= 0 {
 		return CreateActivationResult{}, ErrBatchCapacity
+	}
+	if err = lockProviderActivation(ctx, tx, params.Provider, params.ProviderActivationID); err != nil {
+		return CreateActivationResult{}, err
+	}
+	// A provider activation can only be consumed by the token that first
+	// commits it. A different reserved token is left unresolved for audit.
+	if _, scanErr := scanActivation(tx.QueryRow(ctx,
+		`SELECT `+activationColumns+` FROM activations WHERE provider=$1 AND provider_activation_id=$2`,
+		params.Provider, params.ProviderActivationID,
+	)); scanErr == nil {
+		return CreateActivationResult{}, ErrConflict
+	} else if scanErr != pgx.ErrNoRows {
+		return CreateActivationResult{}, mapError(scanErr)
 	}
 	// Serialize all inserts for a phone fingerprint. PostgreSQL uniqueness alone
 	// prevents two history rows, but an advisory lock also makes the winner and
@@ -138,34 +201,28 @@ func (s *PostgresStore) CreateActivationAtomically(
 		return CreateActivationResult{}, mapError(err)
 	}
 
+	controlAction := string(domain.ControlActionNone)
+	var hiddenAt *time.Time
+	if domain.BatchStatus(batchStatus).Terminal() {
+		controlAction = string(domain.ControlActionDelete)
+		now := time.Now().UTC()
+		hiddenAt = &now
+	}
 	insertQuery := `INSERT INTO activations(
 		batch_id, provider, provider_activation_id, phone_number, phone_fingerprint,
 		service_code, country_code, operator, purchase_price_amount, currency,
-		status, slot_reserved, provider_payload, provider_expires_at, next_run_at
-	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'purchased',true,$11::jsonb,$12,$13)
+		status, slot_reserved, provider_payload, provider_expires_at, next_run_at,
+		control_action, hidden_at
+	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'purchased',true,$11::jsonb,$12,$13,$14,$15)
 	ON CONFLICT(provider, provider_activation_id) DO NOTHING
 	RETURNING ` + activationColumns
 	activation, err := scanActivation(tx.QueryRow(ctx, insertQuery,
 		params.BatchID, params.Provider, params.ProviderActivationID, normalized, fingerprint,
 		params.ServiceCode, params.CountryCode, params.Operator, params.PurchasePriceAmount,
-		params.Currency, payload, params.ProviderExpiresAt, params.NextRunAt,
+		params.Currency, payload, params.ProviderExpiresAt, params.NextRunAt, controlAction, hiddenAt,
 	))
 	if err == pgx.ErrNoRows {
-		activation, err = scanActivation(tx.QueryRow(ctx,
-			`SELECT `+activationColumns+` FROM activations WHERE provider=$1 AND provider_activation_id=$2`,
-			params.Provider, params.ProviderActivationID,
-		))
-		if err != nil {
-			return CreateActivationResult{}, mapError(err)
-		}
-		if activation.BatchID != params.BatchID || activation.PhoneFingerprint != fingerprint ||
-			activation.ServiceCode != params.ServiceCode || activation.CountryCode != params.CountryCode {
-			return CreateActivationResult{}, ErrConflict
-		}
-		if err = tx.Commit(ctx); err != nil {
-			return CreateActivationResult{}, fmt.Errorf("commit raced activation: %w", err)
-		}
-		return CreateActivationResult{Activation: activation, Duplicate: activation.Status == domain.ActivationStatusDuplicate}, nil
+		return CreateActivationResult{}, ErrConflict
 	}
 	if err != nil {
 		return CreateActivationResult{}, mapError(err)
@@ -193,12 +250,23 @@ func (s *PostgresStore) CreateActivationAtomically(
 			return CreateActivationResult{}, mapError(err)
 		}
 	}
-	_, err = tx.Exec(ctx, `UPDATE batches SET
-		status='running', inflight_count=inflight_count+1,
-		started_at=COALESCE(started_at, now()), updated_at=now()
-		WHERE id=$1`, params.BatchID)
+	attemptResult, err := tx.Exec(ctx, `UPDATE batch_purchase_attempts SET
+		state='committed', provider=$2, provider_activation_id=$3,
+		activation_id=$4, failure_reason='', decided_at=now()
+		WHERE token=$1 AND batch_id=$5 AND state='sent'`,
+		params.PurchaseToken, params.Provider, params.ProviderActivationID, activation.ID, params.BatchID)
 	if err != nil {
 		return CreateActivationResult{}, mapError(err)
+	}
+	if attemptResult.RowsAffected() == 0 {
+		return CreateActivationResult{}, ErrConflict
+	}
+	result, err = tx.Exec(ctx, recordBatchPurchaseSQL, params.BatchID)
+	if err != nil {
+		return CreateActivationResult{}, mapError(err)
+	}
+	if result.RowsAffected() == 0 {
+		return CreateActivationResult{}, ErrBatchCapacity
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return CreateActivationResult{}, fmt.Errorf("%w: %v", ErrCommitUnknown, err)
@@ -397,6 +465,30 @@ func (s *PostgresStore) TransitionActivationOwned(
 	return s.transitionActivation(ctx, id, expected, next, failureReason, owner, leaseVersion)
 }
 
+// lockActivationBatch acquires the parent task row before any activation row
+// lock. All transactions that may change task counters follow this order;
+// otherwise stopping a task (task then activation) could deadlock with a
+// worker finalizing a number (activation then task).
+func lockActivationBatch(ctx context.Context, tx pgx.Tx, id int64, owner string, leaseVersion int64, predicate string) (int64, error) {
+	query := `SELECT batch_id FROM activations WHERE id=$1`
+	args := []any{id}
+	if predicate != "" {
+		query += ` ` + predicate
+	}
+	if owner != "" {
+		query += ` AND lease_owner=$2 AND lease_version=$3`
+		args = append(args, owner, leaseVersion)
+	}
+	var batchID int64
+	if err := tx.QueryRow(ctx, query, args...).Scan(&batchID); err != nil {
+		return 0, mapError(err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT id FROM batches WHERE id=$1 FOR UPDATE`, batchID).Scan(&batchID); err != nil {
+		return 0, mapError(err)
+	}
+	return batchID, nil
+}
+
 func (s *PostgresStore) transitionActivation(
 	ctx context.Context,
 	id int64,
@@ -413,6 +505,9 @@ func (s *PostgresStore) transitionActivation(
 		return domain.Activation{}, fmt.Errorf("begin activation transition: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err = lockActivationBatch(ctx, tx, id, owner, leaseVersion, ""); err != nil {
+		return domain.Activation{}, err
+	}
 	selectQuery := `SELECT ` + activationColumns + ` FROM activations WHERE id=$1`
 	selectArgs := []any{id}
 	if owner != "" {
@@ -460,10 +555,8 @@ func (s *PostgresStore) transitionActivation(
 		return domain.Activation{}, mapError(err)
 	}
 	if terminal && current.SlotReserved {
-		if _, err = tx.Exec(ctx, `UPDATE batches SET
-			inflight_count=GREATEST(inflight_count-1, 0), updated_at=now()
-			WHERE id=$1`, current.BatchID); err != nil {
-			return domain.Activation{}, mapError(err)
+		if err = releaseBatchSlot(ctx, tx, current.BatchID, false); err != nil {
+			return domain.Activation{}, err
 		}
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -505,6 +598,9 @@ func (s *PostgresStore) finalizeActivation(
 		return domain.Activation{}, fmt.Errorf("begin activation finalization: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err = lockActivationBatch(ctx, tx, id, owner, leaseVersion, ""); err != nil {
+		return domain.Activation{}, err
+	}
 	selectQuery := `SELECT ` + activationColumns + ` FROM activations WHERE id=$1`
 	selectArgs := []any{id}
 	if owner != "" {
@@ -545,9 +641,8 @@ func (s *PostgresStore) finalizeActivation(
 		return domain.Activation{}, mapError(err)
 	}
 	if current.SlotReserved {
-		if _, err = tx.Exec(ctx, `UPDATE batches SET
-			inflight_count=GREATEST(inflight_count-1, 0), updated_at=now() WHERE id=$1`, current.BatchID); err != nil {
-			return domain.Activation{}, mapError(err)
+		if err = releaseBatchSlot(ctx, tx, current.BatchID, false); err != nil {
+			return domain.Activation{}, err
 		}
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -633,6 +728,9 @@ func (s *PostgresStore) markActivationFulfilled(ctx context.Context, id int64, o
 		return false, fmt.Errorf("begin mark fulfilled: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err = lockActivationBatch(ctx, tx, id, owner, leaseVersion, "AND finished_at IS NULL"); err != nil {
+		return false, err
+	}
 	var batchID int64
 	var already, slotReserved bool
 	var status string
@@ -667,23 +765,27 @@ func (s *PostgresStore) markActivationFulfilled(ctx context.Context, id int64, o
 	if _, err = tx.Exec(ctx, updateQuery, updateArgs...); err != nil {
 		return false, mapError(err)
 	}
-	result, err := tx.Exec(ctx, `UPDATE batches SET
-		fulfilled_count=fulfilled_count+1,
-		inflight_count=GREATEST(inflight_count-1, 0),
-		status=CASE WHEN fulfilled_count+1 >= quantity THEN 'completed' ELSE 'running' END,
-		finished_at=CASE WHEN fulfilled_count+1 >= quantity THEN COALESCE(finished_at, now()) ELSE NULL END,
-		updated_at=now()
-		WHERE id=$1 AND status IN ('pending','running') AND fulfilled_count < quantity`, batchID)
-	if err != nil {
-		return false, mapError(err)
-	}
-	if result.RowsAffected() == 0 {
-		return false, ErrBatchCapacity
+	if err = releaseBatchSlot(ctx, tx, batchID, true); err != nil {
+		return false, err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit mark fulfilled: %w", err)
 	}
 	return true, nil
+}
+
+func releaseBatchSlot(ctx context.Context, tx pgx.Tx, batchID int64, fulfilled bool) error {
+	result, err := tx.Exec(ctx, releaseBatchSlotSQL, batchID, fulfilled)
+	if err != nil {
+		return mapError(err)
+	}
+	if result.RowsAffected() == 0 {
+		if fulfilled {
+			return ErrBatchCapacity
+		}
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *PostgresStore) AdvanceSMSCycle(ctx context.Context, id int64, owner string, nextRunAt time.Time) (int, error) {

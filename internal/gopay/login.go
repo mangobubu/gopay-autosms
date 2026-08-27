@@ -201,7 +201,7 @@ func (c *Client) refreshLocked(ctx context.Context) error {
 	}{"refresh_token", c.session.RefreshToken, c.clientID, c.secret}
 	response, err := c.ssoPost(ctx, "/goto-auth/token", "", body, nil)
 	if err != nil {
-		return err
+		return classifyLoginError(response, err)
 	}
 	data := dataObject(response.json)
 	access := stringValue(data, "access_token")
@@ -288,6 +288,13 @@ func (c *Client) issueTokenLocked(ctx context.Context, grantType, token string) 
 	}
 	response, err := c.ssoPost(ctx, "/goto-auth/token", "", body, headers)
 	if err != nil {
+		classifiedErr := classifyLoginError(response, err)
+		// A normal 403 is how GoPay starts the 2FA branch, but explicit
+		// account/rate-limit login failures must terminate before that generic
+		// branch tries to interpret the response as a challenge.
+		if errors.Is(classifiedErr, ErrLoginFailed) {
+			return false, classifiedErr
+		}
 		var httpErr *HTTPError
 		if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusForbidden {
 			data := dataObject(response.json)
@@ -301,7 +308,7 @@ func (c *Client) issueTokenLocked(ctx context.Context, grantType, token string) 
 			}
 			return false, nil
 		}
-		return false, classifyLoginError(response, err)
+		return false, classifiedErr
 	}
 	if err := classifyLoginError(response, nil); err != nil {
 		return false, err
@@ -327,6 +334,12 @@ func isUnregisteredResponse(status int, body []byte, err error) bool {
 }
 
 func classifyLoginError(response apiResponse, err error) error {
+	if loginFailureResponse(response.status, response.body) {
+		if err == nil {
+			err = &HTTPError{StatusCode: response.status, Body: append([]byte(nil), response.body...)}
+		}
+		return fmt.Errorf("%w: %w", ErrLoginFailed, err)
+	}
 	text := strings.ToLower(string(response.body))
 	if strings.Contains(text, "gopay-119") || strings.Contains(text, "pin salah") || strings.Contains(text, "requires_pin") || strings.Contains(text, "goto_pin") {
 		return ErrPINRequired
@@ -335,6 +348,33 @@ func classifyLoginError(response apiResponse, err error) error {
 		return ErrUnregistered
 	}
 	return err
+}
+
+func loginFailureResponse(status int, body []byte) bool {
+	var expectedCode string
+	switch status {
+	case http.StatusForbidden:
+		expectedCode = "gopay-112"
+	case http.StatusTooManyRequests:
+		expectedCode = "auth:error:ratelimited"
+	default:
+		return false
+	}
+
+	var payload struct {
+		Errors []struct {
+			Code string `json:"code"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	for _, item := range payload.Errors {
+		if strings.EqualFold(strings.TrimSpace(item.Code), expectedCode) {
+			return true
+		}
+	}
+	return false
 }
 
 func intNumber(value any, fallback int) int {

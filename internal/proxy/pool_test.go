@@ -1,21 +1,36 @@
 package proxy
 
-import "testing"
+import (
+	"net/url"
+	"testing"
+)
 
 func TestNormalizeFormats(t *testing.T) {
-	cases := []string{
-		"host.example:8080:user:pass",
-		"socks5://user:pass@host.example:8080",
-		"user:pass@host.example:8080",
-		"host.example:8080@user:pass",
+	cases := []struct {
+		input      string
+		wantScheme string
+	}{
+		{input: "host.example:8080:user:pass", wantScheme: "http"},
+		{input: "host.example:8080", wantScheme: "http"},
+		{input: "[::1]:8080", wantScheme: "http"},
+		{input: "socks5://user:pass@host.example:8080", wantScheme: "socks5"},
+		{input: "HTTPS://host.example:8080", wantScheme: "https"},
+		{input: "user:pass@host.example:8080", wantScheme: "http"},
+		{input: "host.example:8080@user:pass", wantScheme: "http"},
 	}
-	for _, input := range cases {
-		got, err := Normalize(input)
+	for _, test := range cases {
+		got, err := Normalize(test.input)
 		if err != nil {
-			t.Errorf("Normalize(%q): %v", input, err)
+			t.Errorf("Normalize(%q): %v", test.input, err)
+			continue
 		}
-		if got == "" {
-			t.Errorf("Normalize(%q) returned empty", input)
+		parsed, err := url.Parse(got)
+		if err != nil {
+			t.Errorf("url.Parse(Normalize(%q)): %v", test.input, err)
+			continue
+		}
+		if parsed.Scheme != test.wantScheme {
+			t.Errorf("Normalize(%q) scheme = %q, want %q", test.input, parsed.Scheme, test.wantScheme)
 		}
 	}
 }

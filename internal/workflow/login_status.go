@@ -312,7 +312,9 @@ func (m *Manager) probeAccountLoginStatus(ctx context.Context, account domain.Ac
 		version = persistedVersion
 	}
 	if probeErr != nil {
-		if result.Status == gopay.LoginStatusInvalid {
+		if errors.Is(probeErr, gopay.ErrLoginFailed) {
+			view.Error = "登录失败"
+		} else if result.Status == gopay.LoginStatusInvalid {
 			view.Error = "登录已失效，请重新登录"
 		} else if view.Error == "" {
 			view.Error = publicProbeError(probeErr)
@@ -434,6 +436,8 @@ func publicProbeError(err error) string {
 		return "登录状态检查超时，系统将自动重试"
 	case errors.Is(err, gopay.ErrLoginExpired):
 		return "登录已失效，请重新登录"
+	case errors.Is(err, gopay.ErrLoginFailed):
+		return "登录失败"
 	}
 	var httpErr *gopay.HTTPError
 	if errors.As(err, &httpErr) {

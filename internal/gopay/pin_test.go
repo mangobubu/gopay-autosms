@@ -159,6 +159,36 @@ func TestClassifyPINVerificationIDInvalid(t *testing.T) {
 	}
 }
 
+func TestClassifyPINExplicitLoginFailurePreservesHTTPError(t *testing.T) {
+	httpErr := &HTTPError{
+		StatusCode: http.StatusForbidden,
+		Body:       []byte(`{"errors":[{"code":"GoPay-112"}]}`),
+	}
+	err := classifyPINError(httpErr)
+	if !errors.Is(err, ErrLoginFailed) {
+		t.Fatalf("err=%v, want ErrLoginFailed", err)
+	}
+	var restored *HTTPError
+	if !errors.As(err, &restored) || restored != httpErr {
+		t.Fatalf("err=%v does not preserve original *HTTPError", err)
+	}
+}
+
+func TestGetPINStatusClassifiesExplicitLoginFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"errors":[{"code":"GoPay-112"}]}`)
+	}))
+	defer server.Close()
+	client := newPINFixtureClient(t, server, Session{
+		Phone: "81234567890", AccessToken: "access-token", Device: GenerateDeviceIdentity("81234567890"),
+	})
+	_, err := client.GetPINStatus(context.Background())
+	if !errors.Is(err, ErrLoginFailed) {
+		t.Fatalf("GetPINStatus() error=%v, want ErrLoginFailed", err)
+	}
+}
+
 func TestCompletePINResetRequest(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {

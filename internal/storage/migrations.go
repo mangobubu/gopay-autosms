@@ -13,6 +13,8 @@ type migration struct {
 	statements []string
 }
 
+const singleActiveBatchIndexName = "batches_single_active_idx"
+
 var migrations = []migration{
 	{
 		version: 1,
@@ -35,6 +37,7 @@ var migrations = []migration{
 				config jsonb NOT NULL DEFAULT '{}'::jsonb,
 				next_purchase_at timestamptz NOT NULL DEFAULT now(),
 				quantity integer NOT NULL CHECK (quantity > 0),
+				purchased_count integer NOT NULL DEFAULT 0 CHECK (purchased_count >= 0),
 				fulfilled_count integer NOT NULL DEFAULT 0 CHECK (fulfilled_count >= 0),
 				inflight_count integer NOT NULL DEFAULT 0 CHECK (inflight_count >= 0),
 				failure_reason text NOT NULL DEFAULT '',
@@ -134,6 +137,153 @@ var migrations = []migration{
 			`ALTER TABLE batches ADD COLUMN IF NOT EXISTS next_purchase_at timestamptz NOT NULL DEFAULT now()`,
 			`ALTER TABLE activations ADD COLUMN IF NOT EXISTS slot_reserved boolean NOT NULL DEFAULT false`,
 			`ALTER TABLE activations ADD COLUMN IF NOT EXISTS lease_version bigint NOT NULL DEFAULT 0`,
+		},
+	},
+	{
+		version: 3,
+		statements: []string{
+			`ALTER TABLE batches ADD COLUMN IF NOT EXISTS purchased_count integer NOT NULL DEFAULT 0 CHECK (purchased_count >= 0)`,
+			`UPDATE batches b SET purchased_count=(
+				SELECT COUNT(*)::integer FROM activations a WHERE a.batch_id=b.id
+			)`,
+		},
+	},
+	{
+		version: 4,
+		statements: []string{
+			// Block concurrent inserts while historical active rows are
+			// reconciled and the cross-process uniqueness guard is installed.
+			`LOCK TABLE batches IN SHARE ROW EXCLUSIVE MODE`,
+			`WITH stale_batches AS (
+				SELECT id FROM (
+					SELECT id, row_number() OVER (ORDER BY created_at DESC, id DESC) AS active_rank
+					FROM batches
+					WHERE status IN ('pending','running')
+				) ranked
+				WHERE active_rank > 1
+			)
+			UPDATE activations a SET
+				control_action='delete',
+				hidden_at=COALESCE(a.hidden_at, now()),
+				lease_owner='',
+				lease_until=NULL,
+				lease_version=a.lease_version+1,
+				next_run_at=now(),
+				updated_at=now()
+			FROM stale_batches s
+			WHERE a.batch_id=s.id AND a.finished_at IS NULL`,
+			`WITH stale_batches AS (
+				SELECT id FROM (
+					SELECT id, row_number() OVER (ORDER BY created_at DESC, id DESC) AS active_rank
+					FROM batches
+					WHERE status IN ('pending','running')
+				) ranked
+				WHERE active_rank > 1
+			)
+			UPDATE batches b SET
+				status='cancelled',
+				finished_at=COALESCE(b.finished_at, now()),
+				updated_at=now()
+			FROM stale_batches s
+			WHERE b.id=s.id`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS ` + singleActiveBatchIndexName + `
+				ON batches ((true)) WHERE status IN ('pending','running')`,
+		},
+	},
+	{
+		version: 5,
+		statements: []string{
+			`ALTER TABLE batches ADD COLUMN IF NOT EXISTS purchase_reserved_count integer NOT NULL DEFAULT 0 CHECK (purchase_reserved_count >= 0)`,
+			// New writers explicitly insert protocol version one. Keeping zero as
+			// the database default prevents an older binary from starting another
+			// unprotected batch after this migration is installed.
+			`ALTER TABLE batches ADD COLUMN IF NOT EXISTS purchase_protocol_version integer NOT NULL DEFAULT 0`,
+			`CREATE TABLE IF NOT EXISTS batch_purchase_attempts (
+				token text PRIMARY KEY CHECK (btrim(token) <> ''),
+				batch_id bigint NOT NULL REFERENCES batches(id) ON DELETE RESTRICT,
+				state text NOT NULL CHECK (state IN ('reserved','sent','committed','released','unknown','conflicted')),
+				provider text NOT NULL DEFAULT '',
+				provider_activation_id text NOT NULL DEFAULT '',
+				activation_id bigint UNIQUE REFERENCES activations(id) ON DELETE RESTRICT,
+				failure_reason text NOT NULL DEFAULT '',
+				cleanup_state text NOT NULL DEFAULT '' CHECK (cleanup_state IN ('','pending','done')),
+				cleanup_next_at timestamptz,
+				cleanup_lease_owner text NOT NULL DEFAULT '',
+				cleanup_lease_until timestamptz,
+				cleanup_lease_version bigint NOT NULL DEFAULT 0,
+				cleanup_failure_reason text NOT NULL DEFAULT '',
+				reserved_at timestamptz NOT NULL DEFAULT now(),
+				decided_at timestamptz,
+				CHECK (
+					(state IN ('reserved','sent') AND activation_id IS NULL AND decided_at IS NULL)
+					OR (state='committed' AND activation_id IS NOT NULL
+						AND btrim(provider) <> '' AND btrim(provider_activation_id) <> ''
+						AND decided_at IS NOT NULL)
+					OR (state IN ('released','unknown','conflicted') AND activation_id IS NULL AND decided_at IS NOT NULL)
+				),
+				CHECK (
+					(cleanup_state='' AND cleanup_next_at IS NULL
+						AND cleanup_lease_owner='' AND cleanup_lease_until IS NULL)
+					OR (cleanup_state='pending' AND state='unknown'
+						AND btrim(provider) <> '' AND btrim(provider_activation_id) <> ''
+						AND cleanup_next_at IS NOT NULL
+						AND ((cleanup_lease_owner='' AND cleanup_lease_until IS NULL)
+							OR (btrim(cleanup_lease_owner) <> '' AND cleanup_lease_until IS NOT NULL)))
+					OR (cleanup_state='done' AND state='unknown'
+						AND btrim(provider) <> '' AND btrim(provider_activation_id) <> ''
+						AND cleanup_next_at IS NULL
+						AND cleanup_lease_owner='' AND cleanup_lease_until IS NULL)
+				)
+			)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS batch_purchase_attempts_one_unresolved_idx
+				ON batch_purchase_attempts(batch_id) WHERE state IN ('reserved','sent','unknown','conflicted')`,
+			`CREATE INDEX IF NOT EXISTS batch_purchase_attempts_batch_idx
+				ON batch_purchase_attempts(batch_id, reserved_at DESC)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS batch_purchase_attempts_provider_activation_idx
+				ON batch_purchase_attempts(provider, provider_activation_id)
+				WHERE btrim(provider) <> '' AND btrim(provider_activation_id) <> ''`,
+			`CREATE INDEX IF NOT EXISTS batch_purchase_attempts_cleanup_idx
+				ON batch_purchase_attempts(cleanup_next_at, reserved_at)
+				WHERE state='unknown' AND cleanup_state='pending'`,
+			`INSERT INTO batch_purchase_attempts(
+				token, batch_id, state, provider, provider_activation_id,
+				activation_id, reserved_at, decided_at
+			)
+			SELECT 'legacy:' || a.id::text, a.batch_id, 'committed', a.provider,
+				a.provider_activation_id, a.id, a.created_at, a.updated_at
+			FROM activations a
+			ON CONFLICT DO NOTHING`,
+			`UPDATE batches b SET
+				purchased_count=(SELECT COUNT(*)::integer FROM activations a WHERE a.batch_id=b.id),
+				purchase_reserved_count=0,
+				purchase_protocol_version=1`,
+			// Active rows predate the provider-call reservation protocol. Freeze
+			// them during the upgrade; operators can create a fresh protected batch
+			// after every old process has stopped.
+			`UPDATE activations a SET
+				control_action='delete',
+				hidden_at=COALESCE(a.hidden_at, now()),
+				lease_owner='',
+				lease_until=NULL,
+				lease_version=a.lease_version+1,
+				next_run_at=now(),
+				updated_at=now()
+			FROM batches b
+			WHERE a.batch_id=b.id
+				AND b.status IN ('pending','running')
+				AND a.finished_at IS NULL`,
+			`UPDATE batches SET
+				status='failed',
+				failure_reason='购买协议升级，旧任务已冻结以避免重复购买',
+				finished_at=COALESCE(finished_at, now()),
+				updated_at=now()
+			WHERE status IN ('pending','running')`,
+			`ALTER TABLE batches ADD CONSTRAINT batches_purchase_reserved_max_one_chk
+				CHECK (purchase_reserved_count <= 1)`,
+			`ALTER TABLE batches ADD CONSTRAINT batches_active_purchase_capacity_chk
+				CHECK (status NOT IN ('pending','running') OR purchased_count+purchase_reserved_count <= quantity)`,
+			`ALTER TABLE batches ADD CONSTRAINT batches_purchase_protocol_v1_chk
+				CHECK (purchase_protocol_version=1)`,
 		},
 	},
 }

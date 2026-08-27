@@ -189,6 +189,69 @@ func TestCheckLoginStatusNeverRefreshesOrExpiresOn403(t *testing.T) {
 	}
 }
 
+func TestCheckLoginStatusMarksExplicitLoginFailuresInvalidWithoutRefresh(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{
+			name:   "blocked account",
+			status: http.StatusForbidden,
+			body:   `{"errors":[{"code":"GoPay-112"}]}`,
+		},
+		{
+			name:   "login rate limited",
+			status: http.StatusTooManyRequests,
+			body:   `{"errors":[{"code":"auth:error:ratelimited"}]}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var refreshCalls int
+			client := newStatusFixtureClient(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/goto-auth/token" {
+					refreshCalls++
+				}
+				return jsonResponse(test.status, test.body), nil
+			}), "access-1", "refresh-1")
+
+			result, err := client.CheckLoginStatus(context.Background())
+			if result.Status != LoginStatusInvalid || result.Refreshed || result.HTTPStatus != test.status ||
+				!errors.Is(err, ErrLoginFailed) || refreshCalls != 0 {
+				t.Fatalf("result=%+v err=%v refreshCalls=%d", result, err, refreshCalls)
+			}
+			var httpErr *HTTPError
+			if !errors.As(err, &httpErr) || httpErr.StatusCode != test.status {
+				t.Fatalf("classified status error did not preserve HTTPError: %v", err)
+			}
+		})
+	}
+}
+
+func TestGetBalanceMarksExplicitLoginFailures(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{name: "blocked account", status: http.StatusForbidden, body: `{"errors":[{"code":"GoPay-112"}]}`},
+		{name: "login rate limited", status: http.StatusTooManyRequests, body: `{"errors":[{"code":"auth:error:ratelimited"}]}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := newStatusFixtureClient(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path != "/v1/payment-options/balances" {
+					return jsonResponse(http.StatusNotFound, `{}`), nil
+				}
+				return jsonResponse(test.status, test.body), nil
+			}), "access-1", "refresh-1")
+			_, err := client.GetBalance(context.Background())
+			if !errors.Is(err, ErrLoginFailed) {
+				t.Fatalf("GetBalance() error=%v, want ErrLoginFailed", err)
+			}
+		})
+	}
+}
+
 func TestCheckLoginStatusKeepsAmbiguousRefreshRejectionUnknown(t *testing.T) {
 	client := newStatusFixtureClient(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path == "/v1/users/profile" {

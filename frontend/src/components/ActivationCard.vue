@@ -2,10 +2,10 @@
 import { computed } from 'vue'
 import { ElMessage } from 'element-plus'
 
+import { activationExpiryPresentation } from '../activationExpiry'
 import {
   accountLoginStatus,
   activationStatus,
-  formatCountdown,
   formatNumber,
   formatTime,
 } from '../normalizers'
@@ -29,7 +29,12 @@ const loginMeta = computed(() => (
 ))
 const canOperate = computed(() => !props.activation.finishedAt && ['polling', 'active', 'awaiting_subsequent_code'].includes(props.activation.status))
 const isPolling = computed(() => !props.activation.finishedAt && ['polling', 'active', 'awaiting_subsequent_code', 'pin_changed'].includes(props.activation.status))
-const countdown = computed(() => formatCountdown(props.activation.expiresAt, props.nowMs))
+const expiry = computed(() => activationExpiryPresentation(
+  props.activation.status,
+  props.activation.expiresAt,
+  props.activation.finishedAt,
+  props.nowMs,
+))
 
 async function copyPhone(): Promise<void> {
   if (!props.activation.phone || props.activation.phone === '—') return
@@ -92,8 +97,8 @@ async function copyPhone(): Promise<void> {
       </div>
       <div>
         <span>到期时间</span>
-        <strong>{{ formatTime(activation.expiresAt) }}</strong>
-        <small v-if="countdown !== '—'" class="activation-countdown">倒计时 {{ countdown }}</small>
+        <strong>{{ expiry.label }}</strong>
+        <small v-if="expiry.countdown" class="activation-countdown">倒计时 {{ expiry.countdown }}</small>
       </div>
     </div>
 

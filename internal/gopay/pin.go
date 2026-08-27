@@ -43,7 +43,7 @@ func (c *Client) StartPINSetup(ctx context.Context, pin string) (OTPChallenge, e
 	}{ClientID: c.clientID, ClientSecret: c.secret, Flow: "goto_pin_wa_sms"}
 	methodsResponse, err := c.ssoPost(ctx, "/cvs/v1/methods", "", methodsBody, nil)
 	if err != nil {
-		return OTPChallenge{}, err
+		return OTPChallenge{}, classifyPINError(err)
 	}
 	methodsData := dataObject(methodsResponse.json)
 	c.session.PINVerificationID = stringValue(methodsData, "verification_id")
@@ -78,7 +78,7 @@ func (c *Client) StartPINSetup(ctx context.Context, pin string) (OTPChallenge, e
 	extra.Set("key", "value")
 	initResponse, err := c.ssoPost(ctx, c.cvsInitiatePath, "/cvs/v1/initiate", initBody, extra)
 	if err != nil {
-		return OTPChallenge{}, err
+		return OTPChallenge{}, classifyPINError(err)
 	}
 	initData := dataObject(initResponse.json)
 	c.session.PINOTPToken = stringValue(initData, "otp_token")
@@ -113,7 +113,7 @@ func (c *Client) GetPINStatus(ctx context.Context) (PINStatus, error) {
 	}
 	response, err := c.gopayRequest(ctx, http.MethodGet, "/v1/users/profile", nil, nil)
 	if err != nil {
-		return PINStatus{}, err
+		return PINStatus{}, classifyPINError(err)
 	}
 	value, ok := findPINSetupFlag(response.json)
 	return PINStatus{Known: ok, Set: value}, nil

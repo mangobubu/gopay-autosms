@@ -37,6 +37,25 @@ type pinStateStore struct {
 	fulfilledLeaseVersion int64
 	transition            pinStateTransition
 	touch                 pinStateTouch
+	verificationParams    storage.AppendVerificationParams
+	verificationOwner     string
+	verificationVersion   int64
+}
+
+func (s *pinStateStore) AppendVerificationCodeOwned(
+	_ context.Context,
+	params storage.AppendVerificationParams,
+	owner string,
+	leaseVersion int64,
+) (storage.AppendVerificationResult, error) {
+	s.calls = append(s.calls, "append_verification_owned")
+	s.verificationParams = params
+	s.verificationOwner = owner
+	s.verificationVersion = leaseVersion
+	return storage.AppendVerificationResult{
+		Verification: domain.VerificationCode{Code: params.Code},
+		Inserted:     true,
+	}, nil
 }
 
 func (s *pinStateStore) MarkActivationFulfilledOwned(_ context.Context, id int64, owner string, leaseVersion int64) (bool, error) {
@@ -108,6 +127,33 @@ func TestFinalizePINSettingPublishesChangedStateAfterScheduling(t *testing.T) {
 	}
 	if !reflect.DeepEqual(store.transition, wantTransition) {
 		t.Fatalf("transition=%+v, want %+v", store.transition, wantTransition)
+	}
+}
+
+func TestAppendCodeUsesOwnedVerificationWrite(t *testing.T) {
+	store := &pinStateStore{}
+	manager := &Manager{store: store}
+	activation := domain.Activation{
+		ID:           71,
+		SMSCycle:     4,
+		LeaseOwner:   "worker-current",
+		LeaseVersion: 9,
+	}
+
+	code, err := manager.appendCode(context.Background(), activation, domain.VerificationPhasePIN, "123456")
+	if err != nil {
+		t.Fatalf("appendCode() error = %v", err)
+	}
+	if code != "123456" {
+		t.Fatalf("appendCode() code = %q", code)
+	}
+	if store.verificationParams.ActivationID != activation.ID ||
+		store.verificationParams.CycleNo != activation.SMSCycle ||
+		store.verificationParams.Phase != domain.VerificationPhasePIN {
+		t.Fatalf("verification params = %+v", store.verificationParams)
+	}
+	if store.verificationOwner != activation.LeaseOwner || store.verificationVersion != activation.LeaseVersion {
+		t.Fatalf("verification lease = (%q, %d)", store.verificationOwner, store.verificationVersion)
 	}
 }
 

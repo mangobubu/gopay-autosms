@@ -98,6 +98,61 @@ function priceTierFromRecord(record: UnknownRecord): PriceTier | undefined {
   return undefined
 }
 
+function hasPriceTierMetadata(record: UnknownRecord): boolean {
+  return PRICE_TIER_KEYS.some((key) => {
+    const value = record[key]
+    if (value === undefined || value === null) return false
+    return typeof value !== 'string' || value.trim() !== ''
+  })
+}
+
+function priceOptionLabel(item: PriceOption): string {
+  const parts = [item.price === undefined ? '价格待定' : `${formatNumber(item.price)} ₽`]
+  if (item.tier) parts.push(item.tier)
+  if (item.provider) parts.push(item.provider)
+  if (item.stock !== undefined) parts.push(`库存 ${formatNumber(item.stock)}`)
+  return parts.join(' · ')
+}
+
+function isAvailablePrice(item: PriceOption): boolean {
+  return item.price !== undefined && (item.stock === undefined || item.stock > 0)
+}
+
+function derivedPriceTier(index: number, count: number): PriceTier {
+  if (count < 2 || index === 0) return 'Bronze'
+  if (count === 2 || index === count - 1) return 'Gold'
+
+  const tiers: PriceTier[] = ['Bronze', 'Silver', 'Gold']
+  return tiers[Math.min(2, Math.floor((index * tiers.length) / count))]
+}
+
+function deriveMissingPriceTiers(items: PriceOption[]): PriceOption[] {
+  const distinctPrices = Array.from(new Set(
+    items
+      .filter(isAvailablePrice)
+      .map((item) => item.price as number),
+  )).sort((left, right) => left - right)
+  const tierByPrice = new Map(
+    distinctPrices.map((price, index) => [price, derivedPriceTier(index, distinctPrices.length)]),
+  )
+
+  return items.map((item) => {
+    const canDerive = !item.tier
+      && !hasPriceTierMetadata(item.raw)
+      && isAvailablePrice(item)
+    const tier = canDerive ? tierByPrice.get(item.price as number) : item.tier
+    const normalized = {
+      ...item,
+      tier,
+      tierDerived: tier ? canDerive : undefined,
+    } satisfies PriceOption
+    return {
+      ...normalized,
+      label: priceOptionLabel(normalized),
+    }
+  })
+}
+
 function asBoolean(value: unknown): boolean {
   if (typeof value === 'boolean') return value
   if (typeof value === 'number') return value !== 0
@@ -210,24 +265,21 @@ export function normalizePrices(payload: unknown): PriceOption[] {
         pick(raw, ['id', 'code', 'key', 'provider_id', 'providerId']),
         `${provider}:${price ?? entryKey}`,
       )
-      const parts = [price === undefined ? '价格待定' : `${formatNumber(price)} ₽`]
-      if (tier) parts.push(tier)
-      if (provider) parts.push(provider)
-      if (stock !== undefined) parts.push(`库存 ${formatNumber(stock)}`)
       return {
         key: `${id}-${index}`,
         value: id,
-        label: parts.join(' · '),
+        label: '',
         description: asText(pick(raw, ['description', 'label', 'title'])),
         price,
         provider,
         stock,
         tier,
+        tierDerived: tier ? false : undefined,
         raw,
       } satisfies PriceOption
     })
 
-  return normalized
+  const sorted = normalized
     .map((item, originalIndex) => ({ item, originalIndex }))
     .sort((left, right) => {
       const leftPrice = left.item.price
@@ -240,6 +292,8 @@ export function normalizePrices(payload: unknown): PriceOption[] {
       return leftPrice - rightPrice || left.originalIndex - right.originalIndex
     })
     .map(({ item }) => item)
+
+  return deriveMissingPriceTiers(sorted)
 }
 
 export function normalizeSettings(payload: unknown): SMSBowerSettings {
@@ -272,6 +326,13 @@ export function normalizeBatch(payload: unknown): BatchView {
   ]))
   const inflight = asNumber(pick(record, ['inflight', 'inflight_count', 'inflightCount']))
   const failed = asNumber(pick(record, ['failed', 'failed_count']))
+  const purchased = asNumber(pick(record, [
+    'purchased',
+    'purchased_count',
+    'purchasedCount',
+    'purchase_count',
+    'purchaseCount',
+  ]), Math.min(total, successful + inflight + failed))
   const completed = asNumber(
     pick(record, ['completed', 'processed', 'completed_count']),
     successful + failed,
@@ -280,6 +341,7 @@ export function normalizeBatch(payload: unknown): BatchView {
     id: asText(pick(record, ['id', 'batch_id', 'batchId'])),
     status: asText(pick(record, ['status', 'state']), 'pending').toLowerCase(),
     total,
+    purchased,
     completed,
     successful,
     inflight,
@@ -459,6 +521,7 @@ const statusMap: Record<string, StatusMeta> = {
   waiting_login_otp: { label: '等待登录验证码', type: 'warning', active: true },
   pin_required: { label: '需要 PIN，已丢弃', type: 'danger', active: false },
   unregistered: { label: '未注册', type: 'warning', active: false },
+  login_failed: { label: '登录失败', type: 'danger', active: false },
   checking_balance: { label: '查询余额', type: 'primary', active: true },
   zero_rp_used: { label: '0RP已被使用', type: 'info', active: false },
   zero_balance_used: { label: '0RP已被使用', type: 'info', active: false },
@@ -495,7 +558,7 @@ export function batchStatus(status: string): StatusMeta {
     completed: { label: '已完成', type: 'success', active: false },
     success: { label: '已完成', type: 'success', active: false },
     failed: { label: '失败', type: 'danger', active: false },
-    cancelled: { label: '已结束', type: 'info', active: false },
+    cancelled: { label: '已停止', type: 'info', active: false },
   }
   return aliases[status] ?? { label: status || '未知', type: 'info', active: false }
 }

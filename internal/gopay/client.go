@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	proxyaddr "github.com/mangobubu/gopay-autosms/internal/proxy"
 	"golang.org/x/net/proxy"
 )
 
@@ -86,10 +87,6 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("gopay: invalid GoPay base URL %q", cfg.GoPayBaseURL)
 	}
 
-	httpClient, err := configuredHTTPClient(cfg.HTTPClient, cfg.ProxyURL, cfg.Timeout)
-	if err != nil {
-		return nil, err
-	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -122,8 +119,18 @@ func NewClient(cfg Config) (*Client, error) {
 	if state.Device.UniqueID == "" {
 		state.Device = cfg.Device
 	}
-	if state.ProxyURL == "" {
+	if strings.TrimSpace(state.ProxyURL) == "" {
 		state.ProxyURL = cfg.ProxyURL
+	}
+	if strings.TrimSpace(state.ProxyURL) != "" {
+		state.ProxyURL, err = normalizeProxyURL(state.ProxyURL)
+		if err != nil {
+			return nil, err
+		}
+	}
+	httpClient, err := configuredHTTPClient(cfg.HTTPClient, state.ProxyURL, cfg.Timeout)
+	if err != nil {
+		return nil, err
 	}
 	if state.DeviceToken == "" {
 		state.DeviceToken = cfg.DeviceToken
@@ -177,9 +184,13 @@ func configuredHTTPClient(existing *http.Client, proxyRaw string, timeout time.D
 	if client.Timeout == 0 {
 		client.Timeout = timeout
 	}
-	if proxyRaw != "" {
-		proxyURL, err := url.Parse(proxyRaw)
-		if err != nil || proxyURL.Scheme == "" || proxyURL.Host == "" {
+	if strings.TrimSpace(proxyRaw) != "" {
+		normalized, err := normalizeProxyURL(proxyRaw)
+		if err != nil {
+			return nil, err
+		}
+		proxyURL, err := url.Parse(normalized)
+		if err != nil {
 			return nil, fmt.Errorf("gopay: invalid proxy URL %q", proxyRaw)
 		}
 		var transport *http.Transport
@@ -211,6 +222,18 @@ func configuredHTTPClient(existing *http.Client, proxyRaw string, timeout time.D
 		client.Transport = transport
 	}
 	return &client, nil
+}
+
+func normalizeProxyURL(proxyRaw string) (string, error) {
+	raw := strings.TrimSpace(strings.ReplaceAll(proxyRaw, `\@`, "@"))
+	if raw == "" {
+		return "", nil
+	}
+	normalized, err := proxyaddr.Normalize(raw)
+	if err != nil {
+		return "", fmt.Errorf("gopay: invalid proxy URL %q", proxyRaw)
+	}
+	return normalized, nil
 }
 
 func proxyAuth(proxyURL *url.URL) *proxy.Auth {

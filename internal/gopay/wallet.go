@@ -22,6 +22,9 @@ func (c *Client) GetBalance(ctx context.Context) (BalanceResult, error) {
 	response, err := c.gopayRequest(ctx, "GET", "/v1/payment-options/balances", nil, nil)
 	if err != nil {
 		result := BalanceResult{Raw: append([]byte(nil), response.body...)}
+		if loginFailureError(err) {
+			return result, fmt.Errorf("%w: %w", ErrLoginFailed, err)
+		}
 		if response.status >= 200 && response.status < 300 {
 			return result, fmt.Errorf("%w: %v", ErrBalanceUnknown, err)
 		}

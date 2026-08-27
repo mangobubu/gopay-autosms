@@ -259,7 +259,17 @@ func (s *Server) stopBatch(c *gin.Context) {
 	if !ok {
 		return
 	}
-	updated, err := s.store.CancelBatch(c.Request.Context(), id)
+	var (
+		updated domain.Batch
+		err     error
+	)
+	if s.workflow != nil {
+		updated, err = s.workflow.StopBatch(c.Request.Context(), id)
+	} else {
+		// Retain the direct storage path for lightweight HTTP handlers/tests that
+		// intentionally omit the workflow manager.
+		updated, err = s.store.CancelBatch(c.Request.Context(), id)
+	}
 	if err != nil {
 		respondError(c, err)
 		return
@@ -501,7 +511,8 @@ func respondError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, storage.ErrNotFound):
 		status = http.StatusNotFound
-	case errors.Is(err, storage.ErrConflict), errors.Is(err, storage.ErrBatchCapacity):
+	case errors.Is(err, storage.ErrConflict), errors.Is(err, storage.ErrBatchCapacity),
+		errors.Is(err, storage.ErrPurchaseInProgress):
 		status = http.StatusConflict
 	case errors.Is(err, storage.ErrInvalidInput), errors.Is(err, domain.ErrInvalidPIN), errors.Is(err, domain.ErrInvalidPhone):
 		status = http.StatusBadRequest

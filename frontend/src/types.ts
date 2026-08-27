@@ -20,6 +20,7 @@ export interface PriceOption extends CatalogOption {
   provider?: string
   stock?: number
   tier?: PriceTier
+  tierDerived?: boolean
 }
 
 export interface BatchRequest {
@@ -41,6 +42,7 @@ export interface BatchView {
   id: string
   status: string
   total: number
+  purchased: number
   completed: number
   successful: number
   inflight: number

@@ -54,7 +54,7 @@ textarea {
   align-items: center;
   justify-content: space-between;
   height: 72px;
-  padding: 0 max(24px, calc((100vw - 1440px) / 2));
+  padding: 0 24px;
   color: #fff;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(14, 24, 42, 0.97);
@@ -68,7 +68,8 @@ textarea {
 .panel-heading > div,
 .section-heading,
 .section-heading__actions,
-.batch-status-panel__head {
+.batch-status-panel__head,
+.batch-status-panel__actions {
   display: flex;
   align-items: center;
 }
@@ -155,9 +156,9 @@ textarea {
 }
 
 .workspace {
-  width: min(1440px, calc(100% - 48px));
+  width: 100%;
   margin: 0 auto;
-  padding: 44px 0 72px;
+  padding: 44px 24px 72px;
 }
 
 .hero {
@@ -493,7 +494,30 @@ textarea {
 
 .batch-status-panel__head {
   justify-content: space-between;
+  gap: 18px;
   margin-bottom: 20px;
+}
+
+.batch-status-panel__title {
+  min-width: 0;
+}
+
+.batch-status-panel__title h2 {
+  overflow-wrap: anywhere;
+}
+
+.batch-status-panel__actions {
+  flex: none;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.batch-stop-button {
+  min-width: 96px;
+  margin-left: 0 !important;
+  border-radius: 9px;
+  font-weight: 700;
 }
 
 .batch-status-panel h2,
@@ -505,7 +529,7 @@ textarea {
 
 .batch-metrics {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   margin-bottom: 20px;
   border: 1px solid #edf1f6;
   border-radius: 12px;
@@ -939,8 +963,8 @@ textarea {
   }
 
   .workspace {
-    width: min(100% - 28px, 680px);
-    padding: 30px 0 54px;
+    width: 100%;
+    padding: 30px 14px 54px;
   }
 
   .hero {
@@ -974,6 +998,16 @@ textarea {
   .batch-submit-row {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .batch-status-panel__head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .batch-status-panel__actions {
+    justify-content: space-between;
+    width: 100%;
   }
 
   .selection-summary {

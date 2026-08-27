@@ -1,13 +1,13 @@
 import type { PriceOption } from './types'
 
 function isSelectablePrice(item: PriceOption): boolean {
-  return item.stock !== 0 && item.price !== undefined
+  return item.price !== undefined && (item.stock === undefined || item.stock > 0)
 }
 
 function hasSameOfferDetails(left: PriceOption, right: PriceOption): boolean {
   return left.provider === right.provider
-    && left.tier === right.tier
     && left.price === right.price
+    && (left.tierDerived || right.tierDerived || left.tier === right.tier)
 }
 
 export function findRefreshedPrice(

@@ -38,13 +38,18 @@ type Batch struct {
 	ProxyTotal     int             `json:"proxy_total"`
 	NextPurchaseAt time.Time       `json:"next_purchase_at"`
 	Quantity       int             `json:"quantity"`
-	FulfilledCount int             `json:"fulfilled_count"`
-	InflightCount  int             `json:"inflight_count"`
-	FailureReason  string          `json:"failure_reason,omitempty"`
-	CreatedAt      time.Time       `json:"created_at"`
-	UpdatedAt      time.Time       `json:"updated_at"`
-	StartedAt      *time.Time      `json:"started_at,omitempty"`
-	FinishedAt     *time.Time      `json:"finished_at,omitempty"`
+	PurchasedCount int             `json:"purchased_count"`
+	// PurchaseReservedCount is a durable pre-provider-call quota reservation.
+	// Unknown provider outcomes retain this count so another instance cannot
+	// buy a replacement beyond Quantity.
+	PurchaseReservedCount int        `json:"purchase_reserved_count"`
+	FulfilledCount        int        `json:"fulfilled_count"`
+	InflightCount         int        `json:"inflight_count"`
+	FailureReason         string     `json:"failure_reason,omitempty"`
+	CreatedAt             time.Time  `json:"created_at"`
+	UpdatedAt             time.Time  `json:"updated_at"`
+	StartedAt             *time.Time `json:"started_at,omitempty"`
+	FinishedAt            *time.Time `json:"finished_at,omitempty"`
 }
 
 type ActivationStatus string
@@ -56,6 +61,7 @@ const (
 	ActivationStatusLoggingIn              ActivationStatus = "logging_in"
 	ActivationStatusPINRequired            ActivationStatus = "pin_required"
 	ActivationStatusUnregistered           ActivationStatus = "unregistered"
+	ActivationStatusLoginFailed            ActivationStatus = "login_failed"
 	ActivationStatusCheckingBalance        ActivationStatus = "checking_balance"
 	ActivationStatusZeroBalanceUsed        ActivationStatus = "zero_balance_used"
 	ActivationStatusSettingPIN             ActivationStatus = "setting_pin"

@@ -23,6 +23,8 @@ import (
 	"github.com/mangobubu/gopay-autosms/internal/storage"
 )
 
+const purchaseCleanupWorkerCount = 4
+
 type Config struct {
 	PollInterval  time.Duration
 	ActivationTTL time.Duration
@@ -74,9 +76,13 @@ type Manager struct {
 	owner    string
 
 	startOnce   sync.Once
+	startErr    error
 	wg          sync.WaitGroup
 	sem         chan struct{}
+	cleanupSem  chan struct{}
 	purchase    sync.Mutex
+	workerMu    sync.Mutex
+	workers     map[int64]map[int64]activationWorker
 	proxyMu     sync.Mutex
 	activeProxy map[int64]map[string]struct{}
 
@@ -90,6 +96,11 @@ type Manager struct {
 type accountSessionLockEntry struct {
 	gate chan struct{}
 	refs int
+}
+
+type activationWorker struct {
+	leaseVersion int64
+	cancel       context.CancelFunc
 }
 
 func New(store storage.Store, settings *appsettings.Manager, box *secure.Box, cfg Config, logger *slog.Logger) *Manager {
@@ -119,7 +130,10 @@ func New(store storage.Store, settings *appsettings.Manager, box *secure.Box, cf
 	}
 	return &Manager{
 		store: store, settings: settings, box: box, cfg: cfg, logger: logger,
-		owner: fmt.Sprintf("autosms-%d", time.Now().UnixNano()), sem: make(chan struct{}, cfg.WorkerCount),
+		owner:               fmt.Sprintf("autosms-%d", time.Now().UnixNano()),
+		sem:                 make(chan struct{}, cfg.WorkerCount),
+		cleanupSem:          make(chan struct{}, purchaseCleanupWorkerCount),
+		workers:             make(map[int64]map[int64]activationWorker),
 		activeProxy:         make(map[int64]map[string]struct{}),
 		loginStatusCache:    make(map[int64]loginStatusCacheEntry),
 		loginStatusFlights:  make(map[int64]*loginStatusFlight),
@@ -127,14 +141,19 @@ func New(store storage.Store, settings *appsettings.Manager, box *secure.Box, cf
 	}
 }
 
-func (m *Manager) Run(ctx context.Context) {
+func (m *Manager) Run(ctx context.Context) error {
 	m.startOnce.Do(func() {
+		m.startErr = m.cancelStartupBatches(ctx)
+		if m.startErr != nil {
+			return
+		}
 		m.wg.Add(1)
 		go func() {
 			defer m.wg.Done()
 			m.loop(ctx)
 		}()
 	})
+	return m.startErr
 }
 
 func (m *Manager) Wait() { m.wg.Wait() }
@@ -340,6 +359,54 @@ func (m *Manager) Delete(ctx context.Context, activationID int64) error {
 	return m.store.SetControlAction(ctx, activationID, domain.ControlActionDelete)
 }
 
+// StopBatch first persists the durable delete actions and fences every claimed
+// activation in storage. Holding workerMu across that transaction closes the
+// gap where the scheduler could otherwise claim an old workflow after the
+// cancellation snapshot was taken. In-process workers are then interrupted so
+// the newly queued delete actions can be claimed without waiting for a remote
+// request timeout.
+func (m *Manager) StopBatch(ctx context.Context, batchID int64) (domain.Batch, error) {
+	// Let an already-sent GetNumber attempt reach a conclusive response before
+	// cancellation. This avoids turning a known allocation into an unknown one;
+	// no subsequent purchase can start while this gate is held.
+	m.purchase.Lock()
+	defer m.purchase.Unlock()
+
+	m.workerMu.Lock()
+	defer m.workerMu.Unlock()
+	if m.workers == nil {
+		m.workers = make(map[int64]map[int64]activationWorker)
+	}
+
+	batch, err := m.cancelBatchPersistently(ctx, batchID)
+	if err != nil {
+		return domain.Batch{}, err
+	}
+	for _, worker := range m.workers[batchID] {
+		worker.cancel()
+	}
+	delete(m.workers, batchID)
+	return batch, nil
+}
+
+func (m *Manager) cancelBatchPersistently(ctx context.Context, batchID int64) (domain.Batch, error) {
+	var batch domain.Batch
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		attemptCtx := ctx
+		cancel := func() {}
+		if attempt > 0 {
+			attemptCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		}
+		batch, err = m.store.CancelBatch(attemptCtx, batchID)
+		cancel()
+		if err == nil || (!errors.Is(err, storage.ErrCommitUnknown) && !errors.Is(err, storage.ErrRetryable)) {
+			return batch, err
+		}
+	}
+	return batch, err
+}
+
 func (m *Manager) loop(ctx context.Context) {
 	ticker := time.NewTicker(m.cfg.SchedulerTick)
 	defer ticker.Stop()
@@ -358,6 +425,7 @@ func (m *Manager) runTick(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	m.processPurchaseCleanups(ctx)
 	m.purchase.Lock()
 	if batches, err := m.store.ListBatches(ctx, storage.BatchFilter{
 		Statuses: []domain.BatchStatus{domain.BatchStatusPending, domain.BatchStatusRunning}, Page: storage.Page{Limit: 500},
@@ -365,8 +433,8 @@ func (m *Manager) runTick(ctx context.Context) {
 		m.logger.Error("list purchase batches", "error", err)
 	} else {
 		for _, batch := range batches {
-			if batch.FulfilledCount+batch.InflightCount < batch.Quantity && !batch.NextPurchaseAt.After(time.Now()) {
-				m.purchaseOne(ctx, batch)
+			if batchReadyForPurchase(batch, time.Now()) {
+				m.purchaseBatch(ctx, batch)
 			}
 		}
 	}
@@ -376,21 +444,168 @@ func (m *Manager) runTick(ctx context.Context) {
 	if available <= 0 {
 		return
 	}
+	// Claiming a lease and registering its cancellation handle must be one
+	// critical section. Otherwise StopBatch could fence the lease while the
+	// activation is still between ClaimRunnableActivations and registration,
+	// allowing a stale worker to be launched after the stop has returned.
+	type pendingWorker struct {
+		activation domain.Activation
+		ctx        context.Context
+		cancel     context.CancelFunc
+	}
+	pending := make([]pendingWorker, 0, available)
+	m.workerMu.Lock()
 	activations, err := m.store.ClaimRunnableActivations(ctx, m.owner, time.Now().UTC(), m.cfg.LeaseDuration, available)
 	if err != nil {
+		m.workerMu.Unlock()
 		m.logger.Error("claim activations", "error", err)
 		return
 	}
 	for _, activation := range activations {
-		activation := activation
-		m.sem <- struct{}{}
+		workerCtx, cancel := context.WithCancel(ctx)
+		if m.workers == nil {
+			m.workers = make(map[int64]map[int64]activationWorker)
+		}
+		if m.workers[activation.BatchID] == nil {
+			m.workers[activation.BatchID] = make(map[int64]activationWorker)
+		}
+		if previous, ok := m.workers[activation.BatchID][activation.ID]; ok {
+			previous.cancel()
+		}
+		m.workers[activation.BatchID][activation.ID] = activationWorker{
+			leaseVersion: activation.LeaseVersion,
+			cancel:       cancel,
+		}
+		pending = append(pending, pendingWorker{activation: activation, ctx: workerCtx, cancel: cancel})
+	}
+	m.workerMu.Unlock()
+	for _, item := range pending {
+		activation := item.activation
+		workerCtx := item.ctx
+		cancel := item.cancel
+		select {
+		case m.sem <- struct{}{}:
+		case <-workerCtx.Done():
+			cancel()
+			m.unregisterWorker(activation.BatchID, activation.ID, activation.LeaseVersion)
+			continue
+		}
 		m.wg.Add(1)
 		go func() {
 			defer m.wg.Done()
 			defer func() { <-m.sem }()
-			m.processActivation(ctx, activation)
+			defer cancel()
+			defer m.unregisterWorker(activation.BatchID, activation.ID, activation.LeaseVersion)
+			m.processActivation(workerCtx, activation)
 		}()
 	}
+}
+
+func (m *Manager) processPurchaseCleanups(ctx context.Context) {
+	reservedSlots := 0
+reserveSlots:
+	for reservedSlots < cap(m.cleanupSem) {
+		select {
+		case m.cleanupSem <- struct{}{}:
+			reservedSlots++
+		default:
+			break reserveSlots
+		}
+	}
+	if reservedSlots == 0 {
+		return
+	}
+	items, err := m.store.ClaimPurchaseCleanupAttempts(
+		ctx, m.owner, time.Now().UTC(), m.cfg.LeaseDuration, reservedSlots,
+	)
+	if err != nil {
+		for range reservedSlots {
+			<-m.cleanupSem
+		}
+		m.logger.Error("claim purchase cleanups", "error", err)
+		return
+	}
+	for range reservedSlots - len(items) {
+		<-m.cleanupSem
+	}
+	for _, item := range items {
+		m.wg.Add(1)
+		go func(item storage.PurchaseCleanupAttempt) {
+			defer m.wg.Done()
+			defer func() { <-m.cleanupSem }()
+			m.processPurchaseCleanupItem(ctx, item)
+		}(item)
+	}
+}
+
+func (m *Manager) processPurchaseCleanupItem(ctx context.Context, item storage.PurchaseCleanupAttempt) {
+	var err error
+	if item.Provider != "smsbower" {
+		err = fmt.Errorf("unsupported purchase cleanup provider %q", item.Provider)
+	} else {
+		var client *smsbower.Client
+		client, err = m.smsClient(ctx)
+		if err == nil {
+			_, err = client.SetStatus(ctx, item.ProviderActivationID, smsbower.SetStatusCancel)
+		}
+	}
+	if providerActionConcluded(err) {
+		if completeErr := m.store.CompletePurchaseCleanup(ctx, item.Token, item.LeaseOwner, item.LeaseVersion); completeErr != nil {
+			m.logger.Error("complete purchase cleanup", "token", item.Token, "error", completeErr)
+		}
+		return
+	}
+	m.logger.Warn("purchase cleanup failed", "token", item.Token, "provider_id", item.ProviderActivationID, "error", err)
+	if retryErr := m.store.RetryPurchaseCleanup(
+		ctx, item.Token, item.LeaseOwner, item.LeaseVersion,
+		time.Now().UTC().Add(5*time.Second), err.Error(),
+	); retryErr != nil {
+		m.logger.Error("schedule purchase cleanup retry", "token", item.Token, "error", retryErr)
+	}
+}
+
+func (m *Manager) unregisterWorker(batchID, activationID, leaseVersion int64) {
+	m.workerMu.Lock()
+	defer m.workerMu.Unlock()
+	batchWorkers := m.workers[batchID]
+	worker, ok := batchWorkers[activationID]
+	if !ok || worker.leaseVersion != leaseVersion {
+		return
+	}
+	delete(batchWorkers, activationID)
+	if len(batchWorkers) == 0 {
+		delete(m.workers, batchID)
+	}
+}
+
+func batchReadyForPurchase(batch domain.Batch, now time.Time) bool {
+	return !batch.Status.Terminal() &&
+		batch.PurchaseReservedCount == 0 &&
+		batch.PurchasedCount < batch.Quantity &&
+		!batch.NextPurchaseAt.After(now)
+}
+
+func (m *Manager) purchaseBatch(ctx context.Context, batch domain.Batch) {
+	// Re-read under the same gate used by StopBatch. A batch returned by the
+	// scheduler query may have been stopped while that query was in flight.
+	m.workerMu.Lock()
+	latest, err := m.store.GetBatch(ctx, batch.ID)
+	if err != nil {
+		m.workerMu.Unlock()
+		m.logger.Warn("refresh purchase batch", "batch_id", batch.ID, "error", err)
+		return
+	}
+	if !batchReadyForPurchase(latest, time.Now()) {
+		m.workerMu.Unlock()
+		return
+	}
+	m.workerMu.Unlock()
+
+	// Never interrupt GetNumber after it has been sent: its outcome may be a
+	// remotely allocated number even when the response is lost. StopBatch is
+	// serialized by m.purchase and therefore waits for this attempt to either be
+	// persisted or explicitly cancelled before it returns.
+	m.purchaseOne(ctx, latest)
 }
 
 func (m *Manager) smsClient(ctx context.Context) (*smsbower.Client, error) {
@@ -414,50 +629,189 @@ func (m *Manager) purchaseOne(ctx context.Context, batch domain.Batch) {
 		m.noteBatchError(ctx, batch, fmt.Errorf("invalid country ID %q", batch.CountryCode))
 		return
 	}
+	purchaseToken, err := newPurchaseToken()
+	if err != nil {
+		m.noteBatchError(ctx, batch, err)
+		return
+	}
+	if err = m.reservePurchase(ctx, batch.ID, purchaseToken); err != nil {
+		switch {
+		case errors.Is(err, storage.ErrPurchaseInProgress), errors.Is(err, storage.ErrBatchCapacity):
+			return
+		case errors.Is(err, storage.ErrCommitUnknown):
+			reason := "购买名额预占回执未知，供应商请求尚未发送: " + err.Error()
+			if releaseErr := m.releasePurchase(ctx, batch.ID, purchaseToken, time.Now().UTC().Add(2*time.Second), reason); releaseErr != nil {
+				m.logger.Error("resolve uncertain pre-provider reservation", "batch_id", batch.ID, "error", releaseErr)
+			}
+			return
+		default:
+			m.noteBatchError(ctx, batch, err)
+			return
+		}
+	}
+	if err = m.markPurchaseSent(ctx, batch.ID, purchaseToken); err != nil {
+		if errors.Is(err, storage.ErrConflict) || errors.Is(err, storage.ErrNotFound) {
+			return
+		}
+		reason := "购号请求发送标记异常，供应商请求尚未发送: " + err.Error()
+		if releaseErr := m.releasePurchase(ctx, batch.ID, purchaseToken, time.Now().UTC().Add(2*time.Second), reason); releaseErr != nil {
+			m.logger.Error("resolve uncertain purchase send fence", "batch_id", batch.ID, "error", releaseErr)
+		}
+		return
+	}
 	purchased, err := client.GetNumber(ctx, smsbower.NumberRequest{
 		Service: batch.ServiceCode, Country: country, MinPrice: options.MinPrice,
 		MaxPrice: batch.MaxPriceAmount, ProviderIDs: options.ProviderIDs,
-		ExceptProviderIDs: options.ExceptProviderIDs,
+		ExceptProviderIDs: options.ExceptProviderIDs, UserID: purchaseToken, Ref: "autosms",
 	})
 	if err != nil {
 		if errors.Is(err, smsbower.ErrPurchaseUnknown) {
 			m.logger.Error("SMSBower purchase result is unknown; stopping batch to prevent a duplicate purchase", "batch_id", batch.ID, "error", err)
 			reason := "购买结果未知，已停止自动补购以避免重复扣费: " + err.Error()
-			if _, transitionErr := m.store.TransitionBatch(ctx, batch.ID, []domain.BatchStatus{batch.Status}, domain.BatchStatusFailed, reason); transitionErr != nil {
-				_ = m.store.ScheduleBatchPurchase(ctx, batch.ID, time.Now().UTC().Add(24*time.Hour), reason)
+			if _, freezeErr := m.freezePurchase(ctx, batch.ID, purchaseToken, "smsbower", "", reason); freezeErr != nil {
+				m.logger.Error("freeze unknown purchase", "batch_id", batch.ID, "error", freezeErr)
 			}
 			return
 		}
-		m.noteBatchError(ctx, batch, err)
+		m.logger.Warn("purchase attempt failed before allocation", "batch_id", batch.ID, "error", err)
+		next := time.Now().UTC().Add(2 * time.Second)
+		if releaseErr := m.releasePurchase(ctx, batch.ID, purchaseToken, next, err.Error()); releaseErr != nil {
+			reason := "购买预占释放结果未知，已停止自动补购: " + releaseErr.Error()
+			m.logger.Error("release failed purchase reservation", "batch_id", batch.ID, "error", releaseErr)
+			if _, freezeErr := m.freezePurchase(ctx, batch.ID, purchaseToken, "smsbower", "", reason); freezeErr != nil &&
+				!errors.Is(freezeErr, storage.ErrConflict) {
+				m.logger.Error("freeze unreleased purchase", "batch_id", batch.ID, "error", freezeErr)
+			}
+		}
 		return
 	}
 	payload, _ := json.Marshal(purchased)
 	expires := time.Now().UTC().Add(m.cfg.ActivationTTL)
-	created, err := m.store.CreateActivationAtomically(ctx, storage.CreateActivationParams{
-		BatchID: batch.ID, Provider: "smsbower", ProviderActivationID: purchased.ActivationID,
+	params := storage.CreateActivationParams{
+		PurchaseToken: purchaseToken, BatchID: batch.ID, Provider: "smsbower", ProviderActivationID: purchased.ActivationID,
 		PhoneNumber: purchased.PhoneNumber, ServiceCode: batch.ServiceCode, CountryCode: batch.CountryCode,
 		Operator: purchased.Operator, PurchasePriceAmount: firstNonEmpty(purchased.Cost, batch.MaxPriceAmount),
 		Currency: firstNonEmpty(purchased.Currency, batch.Currency), ProviderPayload: payload,
 		ProviderExpiresAt: &expires, NextRunAt: time.Now().UTC(),
-	})
+	}
+	created, err := m.persistPurchasedActivation(ctx, params)
 	if err != nil {
-		if errors.Is(err, storage.ErrCommitUnknown) {
-			m.logger.Error("activation commit outcome unknown; pausing batch without remote cancellation", "batch_id", batch.ID, "error", err)
-			_, _ = m.store.TransitionBatch(ctx, batch.ID, []domain.BatchStatus{batch.Status}, domain.BatchStatusFailed, "号码落库结果未知，已暂停自动补购: "+err.Error())
+		reason := fmt.Sprintf("SMSBower 号码 %s 落库异常，已停止自动补购: %v", purchased.ActivationID, err)
+		resolvedState, freezeErr := m.freezePurchase(ctx, batch.ID, purchaseToken, "smsbower", purchased.ActivationID, reason)
+		if freezeErr != nil {
+			m.logger.Error("freeze unpersisted purchase", "batch_id", batch.ID, "provider_id", purchased.ActivationID, "error", freezeErr)
 			return
 		}
-		// A number was already allocated remotely. Best effort cancellation is
-		// mandatory even if local capacity changed before it could be persisted.
-		_, cancelErr := client.SetStatus(ctx, purchased.ActivationID, smsbower.SetStatusCancel)
-		if cancelErr != nil {
-			m.logger.Error("cancel unpersisted number", "provider_id", purchased.ActivationID, "error", cancelErr)
+		// Freeze acquires the batch and attempt locks, so an unknown result proves
+		// that no activation commit won the race. A committed result must remain
+		// active even when the original COMMIT response was lost.
+		if resolvedState != storage.PurchaseAttemptUnknown {
+			return
 		}
-		m.noteBatchError(ctx, batch, err)
+		m.logger.Warn("queued durable cleanup for unpersisted number", "provider_id", purchased.ActivationID)
 		return
 	}
 	if created.Duplicate {
 		m.logger.Info("historical number detected; cancellation queued", "activation_id", created.Activation.ID)
 	}
+}
+
+func newPurchaseToken() (string, error) {
+	var raw [32]byte
+	if _, err := cryptorand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate purchase token: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
+func (m *Manager) reservePurchase(ctx context.Context, batchID int64, token string) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		attemptCtx := ctx
+		cancel := func() {}
+		if attempt > 0 {
+			attemptCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		}
+		err = m.store.ReserveBatchPurchase(attemptCtx, batchID, token)
+		cancel()
+		if err == nil || (!errors.Is(err, storage.ErrCommitUnknown) && !errors.Is(err, storage.ErrRetryable)) {
+			return err
+		}
+	}
+	return err
+}
+
+func (m *Manager) markPurchaseSent(ctx context.Context, batchID int64, token string) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		attemptCtx := ctx
+		cancel := func() {}
+		if attempt > 0 {
+			attemptCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		}
+		err = m.store.MarkBatchPurchaseSent(attemptCtx, batchID, token)
+		cancel()
+		if err == nil || (!errors.Is(err, storage.ErrCommitUnknown) && !errors.Is(err, storage.ErrRetryable)) {
+			return err
+		}
+	}
+	return err
+}
+
+func (m *Manager) releasePurchase(
+	ctx context.Context,
+	batchID int64,
+	token string,
+	next time.Time,
+	reason string,
+) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		resolutionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		err = m.store.ReleaseBatchPurchaseReservation(resolutionCtx, batchID, token, next, reason)
+		cancel()
+		if err == nil || (!errors.Is(err, storage.ErrCommitUnknown) && !errors.Is(err, storage.ErrRetryable)) {
+			return err
+		}
+	}
+	return err
+}
+
+func (m *Manager) freezePurchase(
+	ctx context.Context,
+	batchID int64,
+	token, provider, providerActivationID, reason string,
+) (storage.PurchaseAttemptState, error) {
+	var state storage.PurchaseAttemptState
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		resolutionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		state, err = m.store.FreezeBatchPurchase(
+			resolutionCtx, batchID, token, provider, providerActivationID, reason,
+		)
+		cancel()
+		if err == nil || (!errors.Is(err, storage.ErrCommitUnknown) && !errors.Is(err, storage.ErrRetryable)) {
+			return state, err
+		}
+	}
+	return state, err
+}
+
+func (m *Manager) persistPurchasedActivation(
+	ctx context.Context,
+	params storage.CreateActivationParams,
+) (storage.CreateActivationResult, error) {
+	var result storage.CreateActivationResult
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		resolutionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		result, err = m.store.CreateActivationAtomically(resolutionCtx, params)
+		cancel()
+		if err == nil || (!errors.Is(err, storage.ErrCommitUnknown) && !errors.Is(err, storage.ErrRetryable)) {
+			return result, err
+		}
+	}
+	return result, err
 }
 
 func (m *Manager) noteBatchError(ctx context.Context, batch domain.Batch, err error) {
@@ -488,7 +842,7 @@ func (m *Manager) processActivation(ctx context.Context, activation domain.Activ
 			} else {
 				err = m.probeAndStartLogin(ctx, activation)
 			}
-		case domain.ActivationStatusDuplicate, domain.ActivationStatusPINRequired, domain.ActivationStatusUnregistered:
+		case domain.ActivationStatusDuplicate, domain.ActivationStatusPINRequired, domain.ActivationStatusUnregistered, domain.ActivationStatusLoginFailed:
 			err = m.finalizeProviderAction(ctx, activation, smsbower.SetStatusCancel)
 		case domain.ActivationStatusAwaitingLoginCode:
 			if m.activationExpired(activation) {
@@ -534,6 +888,7 @@ func (m *Manager) processActivation(ctx context.Context, activation domain.Activ
 			_, err = m.store.TransitionActivationOwned(ctx, activation.ID, nil, domain.ActivationStatusFailed, "unsupported workflow state: "+string(activation.Status), activation.LeaseOwner, activation.LeaseVersion)
 		}
 	}
+	err = m.finalizeLoginFailure(ctx, activation, err)
 	if err != nil {
 		m.logger.Warn("activation step failed", "activation_id", activation.ID, "state", activation.Status, "error", err)
 		// Keep the last actionable reason with the activation so the dashboard
@@ -560,6 +915,13 @@ func (m *Manager) processActivation(ctx context.Context, activation domain.Activ
 		// distinct owner and must never be released by a slow previous worker.
 		_ = m.store.ReleaseActivationLease(ctx, activation.ID, activation.LeaseOwner, latest.NextRunAt)
 	}
+}
+
+func (m *Manager) finalizeLoginFailure(ctx context.Context, activation domain.Activation, err error) error {
+	if !errors.Is(err, gopay.ErrLoginFailed) {
+		return err
+	}
+	return m.cancelAndClassify(ctx, activation, domain.ActivationStatusLoginFailed, "登录失败")
 }
 
 func (m *Manager) acquireAccountSessionLock(ctx context.Context, phone string) (func(), error) {
@@ -889,6 +1251,11 @@ func (m *Manager) checkBalance(ctx context.Context, activation domain.Activation
 	if isHTTPStatus(pinStatusErr, 401) {
 		return pinStatusErr
 	}
+	// Do not silently fall back to PIN setup when GoPay explicitly rejected
+	// the login/session (for example GoPay-112 or auth:error:ratelimited).
+	if errors.Is(pinStatusErr, gopay.ErrLoginFailed) {
+		return pinStatusErr
+	}
 	if pinStatusErr == nil && pinStatus.Known && pinStatus.Set {
 		pinStage = gopay.PINStageResetReadyCycle
 	} else if pinStatusErr != nil {
@@ -1209,10 +1576,15 @@ func (m *Manager) requestAnother(ctx context.Context, activation domain.Activati
 func (m *Manager) appendCode(ctx context.Context, activation domain.Activation, phase domain.VerificationPhase, code string) (string, error) {
 	payload, _ := json.Marshal(map[string]string{"code": code})
 	now := time.Now().UTC()
-	result, err := m.store.AppendVerificationCode(ctx, storage.AppendVerificationParams{
+	params := storage.AppendVerificationParams{
 		ActivationID: activation.ID, CycleNo: activation.SMSCycle, Phase: phase,
 		Code: code, ProviderPayload: payload, ProviderReceivedAt: &now,
-	})
+	}
+	owned, ok := m.store.(storage.OwnedVerificationStore)
+	if !ok {
+		return "", storage.ErrConflict
+	}
+	result, err := owned.AppendVerificationCodeOwned(ctx, params, activation.LeaseOwner, activation.LeaseVersion)
 	if err != nil {
 		return "", err
 	}

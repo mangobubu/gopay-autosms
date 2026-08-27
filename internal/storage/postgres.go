@@ -85,6 +85,9 @@ func mapError(err error) error {
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
 		case "23505":
+			if pgErr.ConstraintName == singleActiveBatchIndexName {
+				return ErrActiveBatchExists
+			}
 			return fmt.Errorf("%w: %s", ErrConflict, pgErr.Message)
 		case "40001", "40P01":
 			return fmt.Errorf("%w: %s", ErrRetryable, pgErr.Message)

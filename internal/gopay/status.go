@@ -63,6 +63,9 @@ func (c *Client) checkLoginStatusLocked(ctx context.Context) (LoginStatusResult,
 			return LoginStatusResult{Status: LoginStatusUnknown}, fmt.Errorf("gopay: login session is not established")
 		}
 		if err := c.refreshLocked(ctx); err != nil {
+			if loginFailureError(err) {
+				return LoginStatusResult{Status: LoginStatusInvalid, HTTPStatus: httpStatus(err)}, fmt.Errorf("%w: %w", ErrLoginFailed, err)
+			}
 			if refreshRejected(err) {
 				return LoginStatusResult{Status: LoginStatusInvalid, HTTPStatus: httpStatus(err)}, fmt.Errorf("%w: refresh token rejected", ErrLoginExpired)
 			}
@@ -78,6 +81,9 @@ func (c *Client) checkLoginStatusLocked(ctx context.Context) (LoginStatusResult,
 	if err == nil {
 		return LoginStatusResult{Status: LoginStatusUnknown, Refreshed: refreshed, HTTPStatus: response.status}, fmt.Errorf("gopay: login status probe returned unexpected HTTP %d", response.status)
 	}
+	if loginFailureResponse(response.status, response.body) {
+		return LoginStatusResult{Status: LoginStatusInvalid, Refreshed: refreshed, HTTPStatus: response.status}, fmt.Errorf("%w: %w", ErrLoginFailed, err)
+	}
 	if !loginAuthFailure(response) {
 		return LoginStatusResult{Status: LoginStatusUnknown, Refreshed: refreshed, HTTPStatus: response.status}, fmt.Errorf("gopay: login status probe: %w", err)
 	}
@@ -89,6 +95,9 @@ func (c *Client) checkLoginStatusLocked(ctx context.Context) (LoginStatusResult,
 	// holding the client lock so a concurrent operation cannot rotate the token
 	// between these two requests.
 	if refreshErr := c.refreshLocked(ctx); refreshErr != nil {
+		if loginFailureError(refreshErr) {
+			return LoginStatusResult{Status: LoginStatusInvalid, HTTPStatus: httpStatus(refreshErr)}, fmt.Errorf("%w: %w", ErrLoginFailed, refreshErr)
+		}
 		if refreshRejected(refreshErr) {
 			return LoginStatusResult{Status: LoginStatusInvalid, HTTPStatus: httpStatus(refreshErr)}, fmt.Errorf("%w: refresh token rejected", ErrLoginExpired)
 		}
@@ -103,10 +112,18 @@ func (c *Client) checkLoginStatusLocked(ctx context.Context) (LoginStatusResult,
 	if retryErr == nil {
 		return LoginStatusResult{Status: LoginStatusUnknown, Refreshed: true, HTTPStatus: retryResponse.status}, fmt.Errorf("gopay: login status retry returned unexpected HTTP %d", retryResponse.status)
 	}
+	if loginFailureResponse(retryResponse.status, retryResponse.body) {
+		return LoginStatusResult{Status: LoginStatusInvalid, Refreshed: true, HTTPStatus: retryResponse.status}, fmt.Errorf("%w: %w", ErrLoginFailed, retryErr)
+	}
 	if loginAuthFailure(retryResponse) {
 		return LoginStatusResult{Status: LoginStatusInvalid, Refreshed: true, HTTPStatus: retryResponse.status}, fmt.Errorf("%w: profile rejected refreshed token", ErrLoginExpired)
 	}
 	return LoginStatusResult{Status: LoginStatusUnknown, Refreshed: refreshed, HTTPStatus: retryResponse.status}, fmt.Errorf("gopay: login status retry: %w", retryErr)
+}
+
+func loginFailureError(err error) bool {
+	var httpErr *HTTPError
+	return errors.As(err, &httpErr) && loginFailureResponse(httpErr.StatusCode, httpErr.Body)
 }
 
 func loginAuthFailure(response apiResponse) bool {

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -129,6 +130,145 @@ func TestProbeClassifiesPINAndUnregistered(t *testing.T) {
 			_, err = client.ProbeLogin(context.Background(), "+62", "8123")
 			if !errors.Is(err, test.want) {
 				t.Fatalf("err=%v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestClassifyLoginErrorExplicitFailures(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{
+			name:   "blocked account",
+			status: http.StatusForbidden,
+			body:   `{"success":false,"errors":[{"code":"GoPay-112","message":"blocked temporarily"}]}`,
+			want:   true,
+		},
+		{
+			name:   "login rate limited",
+			status: http.StatusTooManyRequests,
+			body:   `{"errors":[{"code":"auth:error:ratelimited"}]}`,
+			want:   true,
+		},
+		{
+			name:   "code with wrong status",
+			status: http.StatusBadRequest,
+			body:   `{"errors":[{"code":"GoPay-112"}]}`,
+		},
+		{
+			name:   "code only in message",
+			status: http.StatusForbidden,
+			body:   `{"errors":[{"code":"temporary_policy","message":"GoPay-112"}]}`,
+		},
+		{
+			name:   "code nested below message object",
+			status: http.StatusForbidden,
+			body:   `{"message":{"error":"GoPay-112"}}`,
+		},
+		{
+			name:   "ordinary forbidden",
+			status: http.StatusForbidden,
+			body:   `{"error":"temporary"}`,
+		},
+		{
+			name:   "ordinary rate limit",
+			status: http.StatusTooManyRequests,
+			body:   `{"error":"too_many_requests"}`,
+		},
+		{
+			name:   "non exact rate limit code",
+			status: http.StatusTooManyRequests,
+			body:   `{"errors":[{"code":"auth:error:ratelimited:retry"}]}`,
+		},
+		{
+			name:   "unstructured body",
+			status: http.StatusForbidden,
+			body:   `GoPay-112`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			httpErr := &HTTPError{StatusCode: test.status, Body: []byte(test.body)}
+			err := classifyLoginError(apiResponse{status: test.status, body: []byte(test.body)}, httpErr)
+			if got := errors.Is(err, ErrLoginFailed); got != test.want {
+				t.Fatalf("errors.Is(err, ErrLoginFailed)=%v, want %v; err=%v", got, test.want, err)
+			}
+			if test.want {
+				var preserved *HTTPError
+				if !errors.As(err, &preserved) || preserved != httpErr {
+					t.Fatalf("classified error did not preserve original HTTPError: %v", err)
+				}
+			} else if err != httpErr {
+				t.Fatalf("unmatched response changed error to %v", err)
+			}
+		})
+	}
+}
+
+func TestIssueTokenClassifiesExplicitFailureBeforeGeneric403Challenge(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"errors":[{"code":"GoPay-112"}]}`)
+	}))
+	defer server.Close()
+
+	state := Session{
+		Phone: "8123", AccountID: "account-1", OneFAToken: "one-fa",
+		Device: GenerateDeviceIdentity("8123"),
+	}
+	client, err := NewClient(Config{
+		SSOBaseURL: server.URL, GoPayBaseURL: server.URL,
+		HTTPClient: server.Client(), Session: &state,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticated, err := client.issueTokenLocked(context.Background(), "cvs", "one-fa")
+	if authenticated || !errors.Is(err, ErrLoginFailed) {
+		t.Fatalf("authenticated=%v err=%v, want explicit login failure", authenticated, err)
+	}
+	if strings.Contains(err.Error(), "2FA response has no token") {
+		t.Fatalf("explicit login failure was misclassified as a 2FA challenge: %v", err)
+	}
+}
+
+func TestRefreshClassifiesExplicitLoginFailure(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{name: "blocked account", status: http.StatusForbidden, body: `{"errors":[{"code":"GoPay-112"}]}`},
+		{name: "login rate limited", status: http.StatusTooManyRequests, body: `{"errors":[{"code":"auth:error:ratelimited"}]}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(test.status)
+				fmt.Fprint(w, test.body)
+			}))
+			defer server.Close()
+			client, err := NewClient(Config{
+				SSOBaseURL: server.URL, GoPayBaseURL: server.URL,
+				HTTPClient: server.Client(), Session: &Session{
+					Phone: "8123", RefreshToken: "refresh-1", Device: GenerateDeviceIdentity("8123"),
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = client.Refresh(context.Background())
+			if !errors.Is(err, ErrLoginFailed) {
+				t.Fatalf("Refresh() error=%v, want ErrLoginFailed", err)
+			}
+			var httpErr *HTTPError
+			if !errors.As(err, &httpErr) || httpErr.StatusCode != test.status {
+				t.Fatalf("Refresh() error did not preserve HTTPError: %v", err)
 			}
 		})
 	}

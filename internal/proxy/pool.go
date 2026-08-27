@@ -5,6 +5,7 @@ package proxy
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -58,36 +59,75 @@ func Normalize(raw string) (string, error) {
 	}
 	if strings.Contains(raw, "://") {
 		u, err := url.Parse(raw)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "socks5" && u.Scheme != "socks5h") || u.Hostname() == "" || u.Port() == "" {
+		if err != nil || u == nil || u.Hostname() == "" || !isPort(u.Port()) {
+			return "", ErrInvalid
+		}
+		u.Scheme = strings.ToLower(u.Scheme)
+		if u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "socks5" && u.Scheme != "socks5h" {
 			return "", ErrInvalid
 		}
 		return u.String(), nil
 	}
 
 	// hostname:port:username:password (password may contain colons)
-	parts := strings.SplitN(raw, ":", 4)
-	if len(parts) == 4 && !strings.Contains(parts[1], "@") {
-		return build(parts[0], parts[1], parts[2], parts[3], "http")
+	if host, port, username, password, ok := splitHostPortCredentials(raw); ok {
+		return build(host, port, username, password, "http")
 	}
-	if strings.Count(raw, "@") != 1 {
+	if strings.Count(raw, "@") == 1 {
+		left, right, _ := strings.Cut(raw, "@")
+		// username:password@hostname:port
+		if username, password, ok := strings.Cut(left, ":"); ok {
+			if host, port, valid := splitHostPort(right); valid {
+				return build(host, port, username, password, "http")
+			}
+		}
+		// hostname:port@username:password
+		if host, port, valid := splitHostPort(left); valid {
+			if username, password, ok := strings.Cut(right, ":"); ok {
+				return build(host, port, username, password, "http")
+			}
+		}
 		return "", ErrInvalid
 	}
-	left, right, _ := strings.Cut(raw, "@")
-	// username:password@hostname:port
-	if strings.Count(left, ":") >= 1 {
-		credentials := strings.SplitN(left, ":", 2)
-		hostPort := strings.Split(right, ":")
-		if len(hostPort) == 2 && isPort(hostPort[1]) {
-			return build(hostPort[0], hostPort[1], credentials[0], credentials[1], "http")
-		}
-	}
-	// hostname:port@username:password
-	hostPort := strings.Split(left, ":")
-	credentials := strings.SplitN(right, ":", 2)
-	if len(hostPort) == 2 && len(credentials) == 2 {
-		return build(hostPort[0], hostPort[1], credentials[0], credentials[1], "http")
+
+	// An omitted scheme always means a plain HTTP proxy. Authentication is
+	// optional for local and open proxy endpoints.
+	if host, port, ok := splitHostPort(raw); ok {
+		return buildUnauthenticated(host, port, "http"), nil
 	}
 	return "", ErrInvalid
+}
+
+func splitHostPortCredentials(raw string) (host, port, username, password string, ok bool) {
+	if strings.HasPrefix(raw, "[") {
+		closeBracket := strings.IndexByte(raw, ']')
+		if closeBracket < 0 || closeBracket+1 >= len(raw) || raw[closeBracket+1] != ':' {
+			return "", "", "", "", false
+		}
+		rest := raw[closeBracket+2:]
+		portEnd := strings.IndexByte(rest, ':')
+		if portEnd <= 0 {
+			return "", "", "", "", false
+		}
+		username, password, hasPassword := strings.Cut(rest[portEnd+1:], ":")
+		if !hasPassword {
+			return "", "", "", "", false
+		}
+		return raw[1:closeBracket], rest[:portEnd], username, password, true
+	}
+	parts := strings.SplitN(raw, ":", 4)
+	if len(parts) != 4 || strings.Contains(parts[1], "@") {
+		return "", "", "", "", false
+	}
+	return parts[0], parts[1], parts[2], parts[3], true
+}
+
+func splitHostPort(value string) (string, string, bool) {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(value))
+	if err != nil || strings.TrimSpace(host) == "" || !isPort(port) {
+		return "", "", false
+	}
+	return strings.TrimSpace(host), strings.TrimSpace(port), true
 }
 
 func isPort(value string) bool {
@@ -106,9 +146,13 @@ func build(host, port, username, password, scheme string) (string, error) {
 	if err != nil || portNumber < 1 || portNumber > 65535 {
 		return "", ErrInvalid
 	}
-	u := &url.URL{Scheme: scheme, Host: fmt.Sprintf("%s:%d", host, portNumber)}
+	u := &url.URL{Scheme: scheme, Host: net.JoinHostPort(strings.Trim(host, "[]"), strconv.Itoa(portNumber))}
 	u.User = url.UserPassword(username, password)
 	return u.String(), nil
+}
+
+func buildUnauthenticated(host, port, scheme string) string {
+	return (&url.URL{Scheme: scheme, Host: net.JoinHostPort(strings.Trim(host, "[]"), port)}).String()
 }
 
 func Counts(entries []Entry) (available, total int) {

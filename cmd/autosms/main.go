@@ -50,7 +50,10 @@ func main() {
 		LoginStatusTTL: cfg.LoginStatusTTL,
 		SSOBaseURL:     cfg.GoPaySSOBaseURL, GoPayBaseURL: cfg.GoPayBaseURL,
 	}, logger)
-	workflowManager.Run(ctx)
+	if err = workflowManager.Run(ctx); err != nil {
+		logger.Error("workflow startup cleanup failed", "error", err)
+		os.Exit(1)
+	}
 
 	httpServer := &http.Server{
 		Addr:              cfg.HTTPAddr,

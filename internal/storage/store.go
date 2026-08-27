@@ -4,18 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/mangobubu/gopay-autosms/internal/domain"
 )
 
 var (
-	ErrNotFound      = errors.New("storage: not found")
-	ErrConflict      = errors.New("storage: state conflict")
-	ErrRetryable     = errors.New("storage: retryable transaction failure")
-	ErrBatchCapacity = errors.New("storage: batch quantity already reserved")
-	ErrInvalidInput  = errors.New("storage: invalid input")
-	ErrCommitUnknown = errors.New("storage: transaction commit outcome unknown")
+	ErrNotFound           = errors.New("storage: not found")
+	ErrConflict           = errors.New("storage: state conflict")
+	ErrActiveBatchExists  = fmt.Errorf("当前已有运行中的任务，请先停止当前任务: %w", ErrConflict)
+	ErrRetryable          = errors.New("storage: retryable transaction failure")
+	ErrBatchCapacity      = errors.New("storage: batch quantity already reserved")
+	ErrPurchaseInProgress = fmt.Errorf("购号请求正在处理中，请稍后再次停止任务: %w", ErrConflict)
+	ErrInvalidInput       = errors.New("storage: invalid input")
+	ErrCommitUnknown      = errors.New("storage: transaction commit outcome unknown")
 )
 
 type Page struct {
@@ -55,6 +58,7 @@ type CreateBatchParams struct {
 }
 
 type CreateActivationParams struct {
+	PurchaseToken        string
 	BatchID              int64
 	Provider             string
 	ProviderActivationID string
@@ -72,6 +76,26 @@ type CreateActivationParams struct {
 type CreateActivationResult struct {
 	Activation domain.Activation
 	Duplicate  bool
+}
+
+type PurchaseAttemptState string
+
+const (
+	PurchaseAttemptReserved   PurchaseAttemptState = "reserved"
+	PurchaseAttemptSent       PurchaseAttemptState = "sent"
+	PurchaseAttemptCommitted  PurchaseAttemptState = "committed"
+	PurchaseAttemptReleased   PurchaseAttemptState = "released"
+	PurchaseAttemptUnknown    PurchaseAttemptState = "unknown"
+	PurchaseAttemptConflicted PurchaseAttemptState = "conflicted"
+)
+
+type PurchaseCleanupAttempt struct {
+	Token                string
+	BatchID              int64
+	Provider             string
+	ProviderActivationID string
+	LeaseOwner           string
+	LeaseVersion         int64
 }
 
 type AppendVerificationParams struct {
@@ -122,6 +146,25 @@ type BatchStore interface {
 	CreateBatch(context.Context, CreateBatchParams) (domain.Batch, error)
 	GetBatch(context.Context, int64) (domain.Batch, error)
 	ListBatches(context.Context, BatchFilter) ([]domain.Batch, error)
+	// ReserveBatchPurchase persists the quota token before contacting the
+	// provider. Only one unresolved remote purchase may exist per batch.
+	ReserveBatchPurchase(context.Context, int64, string) error
+	// MarkBatchPurchaseSent is the distributed cancellation fence immediately
+	// before the provider request. A stopped batch cannot enter this state.
+	MarkBatchPurchaseSent(context.Context, int64, string) error
+	// ReleaseBatchPurchaseReservation is used only when the provider proves no
+	// number was allocated. Repeating the same token is idempotent.
+	ReleaseBatchPurchaseReservation(context.Context, int64, string, time.Time, string) error
+	// FreezeBatchPurchase retains the quota after an ambiguous outcome and
+	// stores any known provider identity for later reconciliation. Its returned
+	// state is read under the same locks that resolve a concurrent commit.
+	FreezeBatchPurchase(context.Context, int64, string, string, string, string) (PurchaseAttemptState, error)
+	// RecoverBatchPurchaseOnStartup converts a request left in sent state by a
+	// stopped process into an unknown retained slot before startup cancellation.
+	RecoverBatchPurchaseOnStartup(context.Context, int64) error
+	ClaimPurchaseCleanupAttempts(context.Context, string, time.Time, time.Duration, int) ([]PurchaseCleanupAttempt, error)
+	CompletePurchaseCleanup(context.Context, string, string, int64) error
+	RetryPurchaseCleanup(context.Context, string, string, int64, time.Time, string) error
 	TransitionBatch(context.Context, int64, []domain.BatchStatus, domain.BatchStatus, string) (domain.Batch, error)
 	CancelBatch(context.Context, int64) (domain.Batch, error)
 	ScheduleBatchPurchase(context.Context, int64, time.Time, string) error
@@ -161,6 +204,13 @@ type ActivationStore interface {
 type VerificationStore interface {
 	AppendVerificationCode(context.Context, AppendVerificationParams) (AppendVerificationResult, error)
 	ListVerificationCodes(context.Context, int64) ([]domain.VerificationCode, error)
+}
+
+// OwnedVerificationStore is an optional capability used by workers. It keeps
+// the lease owner/version check in the same transaction as the append while
+// preserving source compatibility for API and lightweight non-worker stores.
+type OwnedVerificationStore interface {
+	AppendVerificationCodeOwned(context.Context, AppendVerificationParams, string, int64) (AppendVerificationResult, error)
 }
 
 type AccountStore interface {

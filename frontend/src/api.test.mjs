@@ -1,7 +1,52 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { ApiError, validateAccountLoginStatusesPayload } from './api.ts'
+import { api, ApiError, validateAccountLoginStatusesPayload } from './api.ts'
+
+test('stops a batch through the batch stop endpoint with POST', async (t) => {
+  const originalFetch = globalThis.fetch
+  t.after(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  let request
+  globalThis.fetch = async (input, init) => {
+    request = { input, init }
+    return new Response(JSON.stringify({ id: 'batch/42', status: 'cancelled' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+
+  const result = await api.stopBatch('batch/42')
+
+  assert.equal(request.input, '/api/batches/batch%2F42/stop')
+  assert.equal(request.init.method, 'POST')
+  assert.equal(request.init.credentials, 'same-origin')
+  assert.deepEqual(result, { id: 'batch/42', status: 'cancelled' })
+})
+
+test('lists batches through the batch collection endpoint', async (t) => {
+  const originalFetch = globalThis.fetch
+  t.after(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  let request
+  globalThis.fetch = async (input, init) => {
+    request = { input, init }
+    return new Response(JSON.stringify({ batches: [{ id: 'batch-7', status: 'running' }] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+
+  const result = await api.getBatches()
+
+  assert.equal(request.input, '/api/batches')
+  assert.equal(request.init.credentials, 'same-origin')
+  assert.deepEqual(result, { batches: [{ id: 'batch-7', status: 'running' }] })
+})
 
 test('accepts an explicit account login status collection, including an empty one', () => {
   const payload = { accounts: [] }

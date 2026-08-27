@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import { findRefreshedPrice } from './priceOptions.ts'
 
-function offer(value, provider, price, tier = undefined, stock = 1) {
+function offer(value, provider, price, tier = undefined, stock = 1, tierDerived = false) {
   return {
     key: `${value}-${provider}`,
     value,
@@ -11,6 +11,7 @@ function offer(value, provider, price, tier = undefined, stock = 1) {
     provider,
     price,
     tier,
+    tierDerived,
     stock,
     raw: {},
   }
@@ -39,4 +40,18 @@ test('clears ambiguous, sold-out, or unpriced refreshed selections', () => {
   assert.equal(findRefreshedPrice(previous, [first, second]), undefined)
   assert.equal(findRefreshedPrice(previous, [offer('old-id', '42', 1.25, 'Bronze', 0)]), undefined)
   assert.equal(findRefreshedPrice(previous, [offer('old-id', '42', undefined, 'Bronze')]), undefined)
+})
+
+test('keeps the refreshed offer when only its derived tier changes', () => {
+  const previous = offer('offer', '42', 1.25, 'Bronze', 1, true)
+  const refreshed = offer('offer', '42', 1.25, 'Silver', 1, true)
+
+  assert.equal(findRefreshedPrice(previous, [refreshed]), refreshed)
+})
+
+test('treats a changed upstream tier as a different offer', () => {
+  const previous = offer('offer', '42', 1.25, 'Bronze')
+  const refreshed = offer('offer', '42', 1.25, 'Silver')
+
+  assert.equal(findRefreshedPrice(previous, [refreshed]), undefined)
 })

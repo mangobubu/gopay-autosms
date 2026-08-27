@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -12,6 +13,10 @@ import (
 
 const verificationColumns = `id, activation_id, cycle_no, phase, ordinal, code,
 	provider_payload, provider_received_at, created_at`
+
+const ownedVerificationLeaseSQL = `SELECT id FROM activations
+	WHERE id=$1 AND lease_owner=$2 AND lease_version=$3 AND finished_at IS NULL
+	FOR UPDATE`
 
 func scanVerification(row rowScanner) (domain.VerificationCode, error) {
 	var verification domain.VerificationCode
@@ -38,6 +43,29 @@ func (s *PostgresStore) AppendVerificationCode(
 	ctx context.Context,
 	params AppendVerificationParams,
 ) (AppendVerificationResult, error) {
+	return s.appendVerificationCode(ctx, params, "", 0, false)
+}
+
+func (s *PostgresStore) AppendVerificationCodeOwned(
+	ctx context.Context,
+	params AppendVerificationParams,
+	owner string,
+	leaseVersion int64,
+) (AppendVerificationResult, error) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" || leaseVersion <= 0 {
+		return AppendVerificationResult{}, ErrInvalidInput
+	}
+	return s.appendVerificationCode(ctx, params, owner, leaseVersion, true)
+}
+
+func (s *PostgresStore) appendVerificationCode(
+	ctx context.Context,
+	params AppendVerificationParams,
+	owner string,
+	leaseVersion int64,
+	requireLease bool,
+) (AppendVerificationResult, error) {
 	params.Code = strings.TrimSpace(params.Code)
 	if params.ActivationID <= 0 || params.CycleNo < 0 || params.Code == "" || !params.Phase.Valid() {
 		return AppendVerificationResult{}, ErrInvalidInput
@@ -52,6 +80,20 @@ func (s *PostgresStore) AppendVerificationCode(
 	// race-free while the cycle unique key makes every two-second poll idempotent.
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, params.ActivationID); err != nil {
 		return AppendVerificationResult{}, mapError(err)
+	}
+	// The worker lease is checked while holding the activation row lock. Task
+	// cancellation clears the owner and increments lease_version, so a worker
+	// from an older process cannot append after cancellation has committed.
+	if requireLease {
+		var activationID int64
+		if err = tx.QueryRow(ctx, ownedVerificationLeaseSQL,
+			params.ActivationID, owner, leaseVersion,
+		).Scan(&activationID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return AppendVerificationResult{}, ErrConflict
+			}
+			return AppendVerificationResult{}, mapError(err)
+		}
 	}
 	// Ordinal is an append-only sequence across the activation. Login and PIN
 	// remain separately labelled, while subsequent messages render as 1, 2, 3…

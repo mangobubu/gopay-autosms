@@ -172,7 +172,14 @@ export const api = {
       body: JSON.stringify(batch),
     }),
 
+  getBatches: () => request<unknown>('/api/batches'),
+
   getBatch: (id: string) => request<unknown>(`/api/batches/${encodeURIComponent(id)}`),
+
+  stopBatch: (id: string) =>
+    request<unknown>(`/api/batches/${encodeURIComponent(id)}/stop`, {
+      method: 'POST',
+    }),
 
   getActivations: (batchId?: string) =>
     request<unknown>(withQuery('/api/activations', { batch_id: batchId })),
