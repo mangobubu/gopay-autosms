@@ -59,6 +59,8 @@ func TestTerminalStatuses(t *testing.T) {
 		ActivationStatusLoginCodeTimeout,
 		ActivationStatusZeroBalanceUsed,
 		ActivationStatusSettingPIN,
+		ActivationStatusPINSubmissionBlocked,
+		ActivationStatusPINCodeTimeout,
 		ActivationStatusPINChanged,
 		ActivationStatusAwaitingSubsequentCode,
 	} {
@@ -68,12 +70,30 @@ func TestTerminalStatuses(t *testing.T) {
 	}
 }
 
+func TestPINSubmissionBlockedStatusIsDurableAndNonTerminal(t *testing.T) {
+	if !ActivationStatusPINSubmissionBlocked.Valid() {
+		t.Fatal("pin_submission_blocked must be a valid activation status")
+	}
+	if ActivationStatusPINSubmissionBlocked.Terminal() {
+		t.Fatal("pin_submission_blocked must remain non-terminal until provider completion is finalized")
+	}
+}
+
 func TestLoginCodeTimeoutStatusIsValidAndNonTerminal(t *testing.T) {
 	if !ActivationStatusLoginCodeTimeout.Valid() {
 		t.Fatal("login_code_timeout must be a valid activation status")
 	}
 	if ActivationStatusLoginCodeTimeout.Terminal() {
 		t.Fatal("login_code_timeout must remain non-terminal until provider cancellation is finalized")
+	}
+}
+
+func TestPINCodeTimeoutStatusIsValidAndNonTerminal(t *testing.T) {
+	if !ActivationStatusPINCodeTimeout.Valid() {
+		t.Fatal("pin_code_timeout must be a valid activation status")
+	}
+	if ActivationStatusPINCodeTimeout.Terminal() {
+		t.Fatal("pin_code_timeout must remain non-terminal until provider cancellation is finalized")
 	}
 }
 

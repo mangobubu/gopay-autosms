@@ -32,7 +32,9 @@ func (s ActivationStatus) Valid() bool {
 		ActivationStatusLoggingIn, ActivationStatusPINRequired, ActivationStatusUnregistered,
 		ActivationStatusLoginFailed, ActivationStatusLoginCodeTimeout,
 		ActivationStatusCheckingBalance, ActivationStatusZeroBalanceUsed, ActivationStatusSettingPIN,
-		ActivationStatusAwaitingPINCode, ActivationStatusPINChanged, ActivationStatusAwaitingSubsequentCode,
+		ActivationStatusPINSubmissionBlocked,
+		ActivationStatusAwaitingPINCode, ActivationStatusPINCodeTimeout,
+		ActivationStatusPINChanged, ActivationStatusAwaitingSubsequentCode,
 		ActivationStatusActive, ActivationStatusSuccess,
 		ActivationStatusExpired, ActivationStatusCancelled, ActivationStatusFailed:
 		return true

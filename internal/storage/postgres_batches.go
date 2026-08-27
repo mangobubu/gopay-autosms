@@ -48,12 +48,22 @@ const conflictBatchPurchaseAttemptSQL = `UPDATE batch_purchase_attempts SET
 	cleanup_lease_version=cleanup_lease_version+1
 	WHERE token=$1 AND state IN ('reserved','sent','unknown','conflicted')`
 
-// cancelBatchActivationsSQL marks unfinished activations for provider cleanup
-// and invalidates any worker lease that may still be in flight. Clearing the
-// lease makes the durable delete action immediately claimable; incrementing
-// lease_version causes stale workers to lose ownership on their next write.
+// cancelBatchActivationsSQL queues unfinished activations for provider cleanup
+// and invalidates any worker lease that may still be in flight. Activations
+// already classified for a provider completion/cancellation retain that
+// durable intent and visibility; every other activation is queued for deletion.
+// Clearing the lease makes cleanup immediately claimable, while incrementing
+// lease_version fences stale workers from their next write.
 const cancelBatchActivationsSQL = `UPDATE activations SET
-	control_action='delete', hidden_at=COALESCE(hidden_at, now()),
+	control_action=CASE
+		WHEN status IN ('pin_submission_blocked','login_code_timeout','pin_code_timeout') THEN control_action
+		ELSE 'delete'
+	END,
+	hidden_at=CASE
+		WHEN status IN ('pin_submission_blocked','login_code_timeout','pin_code_timeout')
+			AND control_action='' THEN hidden_at
+		ELSE COALESCE(hidden_at, now())
+	END,
 	lease_owner='', lease_until=NULL, lease_version=lease_version+1,
 	next_run_at=now(), updated_at=now()
 	WHERE batch_id=$1 AND finished_at IS NULL`
@@ -804,7 +814,8 @@ func (s *PostgresStore) CancelBatch(ctx context.Context, id int64) (domain.Batch
 		}
 	}
 	// Provider work is intentionally not finalized here. Workers must execute
-	// the durable delete action first and then finalize each activation.
+	// each durable cleanup intent (including a protected PIN-blocked completion)
+	// before finalizing the activation.
 	if _, err = tx.Exec(ctx, cancelBatchActivationsSQL, id); err != nil {
 		return domain.Batch{}, mapError(err)
 	}

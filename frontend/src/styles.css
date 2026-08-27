@@ -320,6 +320,10 @@ textarea {
   border-radius: 10px;
 }
 
+.settings-panel .el-select {
+  width: 100%;
+}
+
 .form-row {
   display: grid;
   gap: 14px;

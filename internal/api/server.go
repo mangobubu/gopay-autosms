@@ -11,17 +11,20 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/mangobubu/gopay-autosms/internal/domain"
+	"github.com/mangobubu/gopay-autosms/internal/herosms"
 	proxyaddr "github.com/mangobubu/gopay-autosms/internal/proxy"
 	appsettings "github.com/mangobubu/gopay-autosms/internal/settings"
 	"github.com/mangobubu/gopay-autosms/internal/smsbower"
+	"github.com/mangobubu/gopay-autosms/internal/smsprovider"
 	"github.com/mangobubu/gopay-autosms/internal/storage"
 	"github.com/mangobubu/gopay-autosms/internal/workflow"
 )
 
 type Server struct {
-	store    storage.Store
-	settings *appsettings.Manager
-	workflow *workflow.Manager
+	store            storage.Store
+	settings         *appsettings.Manager
+	workflow         *workflow.Manager
+	smsClientFactory func(context.Context, string) (smsbower.API, error)
 }
 
 func NewRouter(store storage.Store, settings *appsettings.Manager, manager *workflow.Manager, spa http.Handler) *gin.Engine {
@@ -51,6 +54,9 @@ func (s *Server) register(group *gin.RouterGroup) {
 	group.GET("/settings/smsbower", s.getSMSBowerSettings)
 	group.PUT("/settings/smsbower", s.putSMSBowerSettings)
 	group.POST("/settings/smsbower/test", s.testSMSBowerSettings)
+	group.GET("/settings/hero-sms", s.getHeroSMSSettings)
+	group.PUT("/settings/hero-sms", s.putHeroSMSSettings)
+	group.POST("/settings/hero-sms/test", s.testHeroSMSSettings)
 	group.GET("/catalog/services", s.listServices)
 	group.GET("/catalog/countries", s.listCountries)
 	group.GET("/catalog/prices", s.listPrices)
@@ -105,7 +111,49 @@ func (s *Server) putSMSBowerSettings(c *gin.Context) {
 }
 
 func (s *Server) testSMSBowerSettings(c *gin.Context) {
-	client, err := s.newSMSClient(c.Request.Context())
+	client, err := s.newSMSClient(c.Request.Context(), smsprovider.SMSBower)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	services, err := client.GetServicesList(c.Request.Context())
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "services": len(services)})
+}
+
+func (s *Server) getHeroSMSSettings(c *gin.Context) {
+	value, err := s.settings.GetHeroSMS(c.Request.Context())
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"api_key":    appsettings.MaskAPIKey(value.APIKey),
+		"configured": strings.TrimSpace(value.APIKey) != "",
+	})
+}
+
+func (s *Server) putHeroSMSSettings(c *gin.Context) {
+	var request struct {
+		APIKey string `json:"api_key"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		respondError(c, fmt.Errorf("invalid settings: %w", err))
+		return
+	}
+	value, err := s.settings.SetHeroSMS(c.Request.Context(), appsettings.HeroSMS{APIKey: request.APIKey})
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"api_key": appsettings.MaskAPIKey(value.APIKey), "configured": value.APIKey != ""})
+}
+
+func (s *Server) testHeroSMSSettings(c *gin.Context) {
+	client, err := s.newSMSClient(c.Request.Context(), smsprovider.HeroSMS)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -119,7 +167,12 @@ func (s *Server) testSMSBowerSettings(c *gin.Context) {
 }
 
 func (s *Server) listServices(c *gin.Context) {
-	client, err := s.newSMSClient(c.Request.Context())
+	provider, err := smsprovider.Normalize(c.Query("sms_provider"))
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	client, err := s.newSMSClient(c.Request.Context(), provider)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -133,7 +186,12 @@ func (s *Server) listServices(c *gin.Context) {
 }
 
 func (s *Server) listCountries(c *gin.Context) {
-	client, err := s.newSMSClient(c.Request.Context())
+	provider, err := smsprovider.Normalize(c.Query("sms_provider"))
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	client, err := s.newSMSClient(c.Request.Context(), provider)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -149,10 +207,15 @@ func (s *Server) listCountries(c *gin.Context) {
 func (s *Server) listPrices(c *gin.Context) {
 	country, err := strconv.Atoi(c.Query("country"))
 	if err != nil {
-		respondError(c, fmt.Errorf("country must be a numeric SMSBower country ID"))
+		respondError(c, fmt.Errorf("country must be a numeric SMS country ID"))
 		return
 	}
-	client, err := s.newSMSClient(c.Request.Context())
+	provider, err := smsprovider.Normalize(c.Query("sms_provider"))
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	client, err := s.newSMSClient(c.Request.Context(), provider)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -161,6 +224,12 @@ func (s *Server) listPrices(c *gin.Context) {
 	if err != nil {
 		respondError(c, err)
 		return
+	}
+	if provider == smsprovider.HeroSMS {
+		for index := range prices {
+			prices[index].ProviderID = 0
+			prices[index].Tier = ""
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"prices": prices})
 }
@@ -173,6 +242,8 @@ type createBatchRequest struct {
 	Price        float64 `json:"price"`
 	MaxPrice     string  `json:"max_price"`
 	Provider     string  `json:"provider"`
+	SMSProvider  string  `json:"sms_provider"`
+	Source       string  `json:"source"`
 	ProviderIDs  []int64 `json:"provider_ids"`
 	Quantity     int     `json:"quantity" binding:"required,min=1"`
 	PIN          string  `json:"pin" binding:"required"`
@@ -199,6 +270,36 @@ func (s *Server) createBatch(c *gin.Context) {
 		respondError(c, fmt.Errorf("price is required"))
 		return
 	}
+	smsSource := request.SMSProvider
+	if strings.TrimSpace(smsSource) == "" {
+		smsSource = request.Source
+	}
+	smsSource, err := smsprovider.Normalize(smsSource)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	if strings.TrimSpace(request.SMSProvider) != "" && strings.TrimSpace(request.Source) != "" {
+		normalizedSource, normalizeErr := smsprovider.Normalize(request.Source)
+		if normalizeErr != nil {
+			respondError(c, normalizeErr)
+			return
+		}
+		if smsSource != normalizedSource {
+			respondError(c, fmt.Errorf("%w: sms_provider %q conflicts with source %q", storage.ErrInvalidInput, request.SMSProvider, request.Source))
+			return
+		}
+	}
+	if smsSource == smsprovider.HeroSMS {
+		// HeroSMS getPrices does not expose the account currency. The actual
+		// currency is taken from getNumber after allocation instead of trusting a
+		// client-side guess on the batch.
+		request.Currency = ""
+		if strings.TrimSpace(request.Provider) != "" || len(request.ProviderIDs) != 0 {
+			respondError(c, fmt.Errorf("%w: hero-sms does not support provider filters", storage.ErrInvalidInput))
+			return
+		}
+	}
 	if len(request.ProviderIDs) == 0 && request.Provider != "" {
 		if providerID, err := strconv.ParseInt(request.Provider, 10, 64); err == nil {
 			request.ProviderIDs = []int64{providerID}
@@ -217,7 +318,7 @@ func (s *Server) createBatch(c *gin.Context) {
 		ServiceCode: request.Service, ServiceName: request.ServiceName,
 		CountryCode: request.Country, CountryName: request.CountryName,
 		MaxPrice: request.MaxPrice, Currency: request.Currency, Quantity: request.Quantity, PIN: request.PIN,
-		Options: workflow.BatchOptions{ProviderIDs: request.ProviderIDs, MinPrice: request.MaxPrice, GoPayCountryCode: request.GoPayCountry},
+		Options: workflow.BatchOptions{SMSProvider: smsSource, ProviderIDs: request.ProviderIDs, MinPrice: request.MaxPrice, GoPayCountryCode: request.GoPayCountry},
 		Proxies: proxyEntries,
 	})
 	if err != nil {
@@ -423,12 +524,30 @@ func (s *Server) dashboard(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"batches": batches, "activations": views})
 }
 
-func (s *Server) newSMSClient(ctx context.Context) (*smsbower.Client, error) {
-	value, err := s.settings.GetSMSBower(ctx)
+func (s *Server) newSMSClient(ctx context.Context, provider string) (smsbower.API, error) {
+	if s.smsClientFactory != nil {
+		return s.smsClientFactory(ctx, provider)
+	}
+	provider, err := smsprovider.Normalize(provider)
 	if err != nil {
 		return nil, err
 	}
-	return smsbower.NewClient(smsbower.Config{APIKey: value.APIKey, BaseURL: value.BaseURL})
+	switch provider {
+	case smsprovider.SMSBower:
+		value, getErr := s.settings.GetSMSBower(ctx)
+		if getErr != nil {
+			return nil, getErr
+		}
+		return smsbower.NewClient(smsbower.Config{APIKey: value.APIKey, BaseURL: value.BaseURL})
+	case smsprovider.HeroSMS:
+		value, getErr := s.settings.GetHeroSMS(ctx)
+		if getErr != nil {
+			return nil, getErr
+		}
+		return herosms.NewClient(herosms.Config{APIKey: value.APIKey, BaseURL: value.BaseURL})
+	default:
+		return nil, fmt.Errorf("invalid sms_provider %q", provider)
+	}
 }
 
 func (s *Server) activationViews(ctx context.Context, filter storage.ActivationFilter) ([]gin.H, error) {

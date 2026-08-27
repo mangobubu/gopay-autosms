@@ -1,4 +1,4 @@
-import type { BatchRequest, SMSBowerSettings } from './types'
+import type { BatchRequest, SMSProvider, SMSProviderSettings } from './types'
 
 export class ApiError extends Error {
   readonly status: number
@@ -146,30 +146,50 @@ export function validateAccountLoginStatusesPayload(payload: unknown): unknown {
 }
 
 export const api = {
-  getSettings: () => request<unknown>('/api/settings/smsbower'),
+  getSettings: (smsProvider: SMSProvider = 'smsbower') =>
+    request<unknown>(`/api/settings/${encodeURIComponent(smsProvider)}`),
 
-  saveSettings: (settings: SMSBowerSettings) =>
-    request<unknown>('/api/settings/smsbower', {
-      method: 'PUT',
-      body: JSON.stringify({
-        api_key: settings.apiKey,
-      }),
+  saveSettings: (
+    settings: SMSProviderSettings,
+    smsProvider: SMSProvider = 'smsbower',
+  ) => request<unknown>(`/api/settings/${encodeURIComponent(smsProvider)}`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      api_key: settings.apiKey,
     }),
+  }),
 
-  getServices: () => request<unknown>('/api/catalog/services'),
+  getServices: (smsProvider: SMSProvider = 'smsbower') =>
+    request<unknown>(withQuery('/api/catalog/services', { sms_provider: smsProvider })),
 
-  getCountries: (service: string) =>
-    request<unknown>(withQuery('/api/catalog/countries', { service })),
+  getCountries: (service: string, smsProvider: SMSProvider = 'smsbower') =>
+    request<unknown>(withQuery('/api/catalog/countries', {
+      service,
+      sms_provider: smsProvider,
+    })),
 
-  getPrices: (service: string, country: string) =>
-    request<unknown>(withQuery('/api/catalog/prices', { service, country }), {
+  getPrices: (
+    service: string,
+    country: string,
+    smsProvider: SMSProvider = 'smsbower',
+  ) => request<unknown>(withQuery('/api/catalog/prices', {
+    service,
+    country,
+    sms_provider: smsProvider,
+  }), {
       cache: 'no-store',
     }),
 
-  createBatch: (batch: BatchRequest) =>
+  createBatch: (
+    batch: BatchRequest,
+    smsProvider: SMSProvider = batch.sms_provider ?? 'smsbower',
+  ) =>
     request<unknown>('/api/batches', {
       method: 'POST',
-      body: JSON.stringify(batch),
+      body: JSON.stringify({
+        ...batch,
+        sms_provider: smsProvider,
+      }),
     }),
 
   getBatches: () => request<unknown>('/api/batches'),

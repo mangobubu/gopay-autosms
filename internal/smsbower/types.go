@@ -45,6 +45,10 @@ type Config struct {
 	APIKey     string
 	BaseURL    string
 	HTTPClient HTTPDoer
+	// PriceActions overrides the ordered catalogue actions attempted by
+	// GetPrices. Compatible gateways that only implement the legacy action can
+	// set this to []string{"getPrices"} and avoid two guaranteed failures.
+	PriceActions []string
 }
 
 // Service is one entry returned by getServicesList.
@@ -112,6 +116,7 @@ type Activation struct {
 	Cost             string          `json:"activationCost,omitempty"`
 	Currency         string          `json:"currency,omitempty"`
 	CountryCode      string          `json:"countryCode,omitempty"`
+	CountryPhoneCode string          `json:"countryPhoneCode,omitempty"`
 	CanGetAnotherSMS bool            `json:"canGetAnotherSms,omitempty"`
 	ActivatedAt      time.Time       `json:"activationTime,omitempty"`
 	Operator         string          `json:"activationOperator,omitempty"`

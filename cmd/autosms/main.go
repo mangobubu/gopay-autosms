@@ -44,7 +44,7 @@ func main() {
 		logger.Error("secret storage startup failed", "error", err)
 		os.Exit(1)
 	}
-	settingsManager := appsettings.New(store, box, cfg.SMSBaseURL)
+	settingsManager := appsettings.New(store, box, cfg.SMSBaseURL, cfg.HeroSMSBaseURL)
 	workflowManager := workflow.New(store, settingsManager, box, workflow.Config{
 		PollInterval: cfg.PollInterval, ActivationTTL: cfg.ActivationTTL,
 		LoginStatusTTL: cfg.LoginStatusTTL,

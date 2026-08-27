@@ -166,6 +166,49 @@ func TestActivationStepFailureReasonPreservesLoginFailureDetail(t *testing.T) {
 	}
 }
 
+func TestActivationStepFailureReasonPreservesPINSubmissionBlockedDetail(t *testing.T) {
+	const original = "GoPay 操作失败（阶段：提交新 PIN；HTTP 403；错误码：GoPay-112）"
+	activation := domain.Activation{
+		Status:        domain.ActivationStatusPINSubmissionBlocked,
+		FailureReason: original,
+	}
+
+	if reason := activationStepFailureReason(activation, errors.New("SMSBower complete temporarily failed")); reason != original {
+		t.Fatalf("reason=%q, want original detail %q", reason, original)
+	}
+}
+
+func TestPINSubmissionBlockedFailureRequiresExactStructuredMatch(t *testing.T) {
+	matchingHTTPError := &gopay.HTTPError{
+		StatusCode: http.StatusForbidden,
+		Body:       []byte(`{"errors":[{"code":"GoPay-112"}]}`),
+	}
+	matching := fmt.Errorf("complete PIN: %w: %w", gopay.ErrLoginFailed, matchingHTTPError)
+
+	for _, test := range []struct {
+		name   string
+		status domain.ActivationStatus
+		err    error
+		want   bool
+	}{
+		{name: "exact setting PIN failure", status: domain.ActivationStatusSettingPIN, err: matching, want: true},
+		{name: "different activation stage", status: domain.ActivationStatusAwaitingPINCode, err: matching},
+		{name: "HTTP error not retained", status: domain.ActivationStatusSettingPIN, err: gopay.ErrLoginFailed},
+		{name: "wrong HTTP status", status: domain.ActivationStatusSettingPIN, err: fmt.Errorf("%w: %w", gopay.ErrLoginFailed, &gopay.HTTPError{StatusCode: http.StatusTooManyRequests, Body: matchingHTTPError.Body})},
+		{name: "case variant code", status: domain.ActivationStatusSettingPIN, err: fmt.Errorf("%w: %w", gopay.ErrLoginFailed, &gopay.HTTPError{StatusCode: http.StatusForbidden, Body: []byte(`{"errors":[{"code":"gopay-112"}]}`)})},
+		{name: "space padded code", status: domain.ActivationStatusSettingPIN, err: fmt.Errorf("%w: %w", gopay.ErrLoginFailed, &gopay.HTTPError{StatusCode: http.StatusForbidden, Body: []byte(`{"errors":[{"code":" GoPay-112 "}]}`)})},
+		{name: "code outside errors array", status: domain.ActivationStatusSettingPIN, err: fmt.Errorf("%w: %w", gopay.ErrLoginFailed, &gopay.HTTPError{StatusCode: http.StatusForbidden, Body: []byte(`{"code":"GoPay-112"}`)})},
+		{name: "code only in message", status: domain.ActivationStatusSettingPIN, err: fmt.Errorf("%w: %w", gopay.ErrLoginFailed, &gopay.HTTPError{StatusCode: http.StatusForbidden, Body: []byte(`{"errors":[{"code":"GoPay-113","message":"GoPay-112"}]}`)})},
+		{name: "invalid JSON", status: domain.ActivationStatusSettingPIN, err: fmt.Errorf("%w: %w", gopay.ErrLoginFailed, &gopay.HTTPError{StatusCode: http.StatusForbidden, Body: []byte(`not JSON`)})},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := pinSubmissionBlockedFailure(test.status, test.err); got != test.want {
+				t.Fatalf("pinSubmissionBlockedFailure()=%v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestActivationStepFailureReasonUsesCurrentErrorOutsideLoginFailureFinalization(t *testing.T) {
 	activation := domain.Activation{
 		Status:        domain.ActivationStatusAwaitingPINCode,

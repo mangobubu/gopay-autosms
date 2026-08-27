@@ -48,6 +48,97 @@ test('lists batches through the batch collection endpoint', async (t) => {
   assert.deepEqual(result, { batches: [{ id: 'batch-7', status: 'running' }] })
 })
 
+test('routes settings and catalog requests through the selected SMS provider', async (t) => {
+  const originalFetch = globalThis.fetch
+  t.after(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  const requests = []
+  globalThis.fetch = async (input, init) => {
+    requests.push({ input, init })
+    return new Response('{}', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+
+  await api.getSettings('hero-sms')
+  await api.saveSettings({ apiKey: 'hero-key' }, 'hero-sms')
+  await api.getServices('hero-sms')
+  await api.getCountries('tg', 'hero-sms')
+  await api.getPrices('tg', '6', 'hero-sms')
+
+  assert.deepEqual(requests.map(({ input }) => input), [
+    '/api/settings/hero-sms',
+    '/api/settings/hero-sms',
+    '/api/catalog/services?sms_provider=hero-sms',
+    '/api/catalog/countries?service=tg&sms_provider=hero-sms',
+    '/api/catalog/prices?service=tg&country=6&sms_provider=hero-sms',
+  ])
+  assert.equal(requests[1].init.method, 'PUT')
+  assert.deepEqual(JSON.parse(requests[1].init.body), { api_key: 'hero-key' })
+  assert.equal(requests[4].init.cache, 'no-store')
+})
+
+test('sends the selected SMS provider without inventing a HeroSMS currency', async (t) => {
+  const originalFetch = globalThis.fetch
+  t.after(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  let request
+  globalThis.fetch = async (input, init) => {
+    request = { input, init }
+    return new Response(JSON.stringify({ id: 'batch-hero' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+
+  await api.createBatch({
+    sms_provider: 'hero-sms',
+    service: 'tg',
+    country: '6',
+    quantity: 1,
+    pin: '123456',
+  })
+
+  assert.equal(request.input, '/api/batches')
+  assert.deepEqual(JSON.parse(request.init.body), {
+    sms_provider: 'hero-sms',
+    service: 'tg',
+    country: '6',
+    quantity: 1,
+    pin: '123456',
+  })
+})
+
+test('defaults legacy batch calls to SMSBower', async (t) => {
+  const originalFetch = globalThis.fetch
+  t.after(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  let body
+  globalThis.fetch = async (_input, init) => {
+    body = JSON.parse(init.body)
+    return new Response('{}', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+
+  await api.createBatch({
+    service: 'tg',
+    country: '6',
+    quantity: 1,
+    pin: '123456',
+  })
+
+  assert.equal(body.sms_provider, 'smsbower')
+})
+
 test('accepts an explicit account login status collection, including an empty one', () => {
   const payload = { accounts: [] }
   assert.equal(validateAccountLoginStatusesPayload(payload), payload)

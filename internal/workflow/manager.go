@@ -16,16 +16,21 @@ import (
 
 	"github.com/mangobubu/gopay-autosms/internal/domain"
 	"github.com/mangobubu/gopay-autosms/internal/gopay"
+	"github.com/mangobubu/gopay-autosms/internal/herosms"
 	proxyaddr "github.com/mangobubu/gopay-autosms/internal/proxy"
 	"github.com/mangobubu/gopay-autosms/internal/secure"
 	appsettings "github.com/mangobubu/gopay-autosms/internal/settings"
 	"github.com/mangobubu/gopay-autosms/internal/smsbower"
+	"github.com/mangobubu/gopay-autosms/internal/smsprovider"
 	"github.com/mangobubu/gopay-autosms/internal/storage"
 )
 
 const (
-	purchaseCleanupWorkerCount = 4
-	loginCodeWaitTimeout       = 180 * time.Second
+	purchaseCleanupWorkerCount  = 4
+	verificationCodeWait        = 60 * time.Second
+	verificationCodeResends     = 3
+	verificationCheckpointSaves = 3
+	verificationCheckpointRetry = 25 * time.Millisecond
 )
 
 type Config struct {
@@ -43,6 +48,7 @@ type Config struct {
 }
 
 type BatchOptions struct {
+	SMSProvider       string      `json:"sms_provider,omitempty"`
 	ProviderIDs       []int64     `json:"provider_ids,omitempty"`
 	ExceptProviderIDs []int64     `json:"except_provider_ids,omitempty"`
 	MinPrice          string      `json:"min_price,omitempty"`
@@ -168,12 +174,13 @@ func (m *Manager) CreateBatch(ctx context.Context, input CreateBatchInput) (doma
 	if input.Quantity <= 0 || strings.TrimSpace(input.ServiceCode) == "" || strings.TrimSpace(input.CountryCode) == "" || strings.TrimSpace(input.MaxPrice) == "" {
 		return domain.Batch{}, storage.ErrInvalidInput
 	}
-	smsCfg, err := m.settings.GetSMSBower(ctx)
+	provider, err := smsprovider.Normalize(input.Options.SMSProvider)
 	if err != nil {
-		return domain.Batch{}, err
+		return domain.Batch{}, fmt.Errorf("%w: %v", storage.ErrInvalidInput, err)
 	}
-	if strings.TrimSpace(smsCfg.APIKey) == "" {
-		return domain.Batch{}, fmt.Errorf("SMSBower API Key 尚未配置")
+	input.Options.SMSProvider = provider
+	if err = m.validateSMSProviderKey(ctx, provider); err != nil {
+		return domain.Batch{}, err
 	}
 	for _, entry := range input.Proxies {
 		ciphertext, sealErr := m.box.Seal([]byte(entry.URL))
@@ -202,6 +209,30 @@ func (m *Manager) CreateBatch(ctx context.Context, input CreateBatchInput) (doma
 		return domain.Batch{}, err
 	}
 	return batch, nil
+}
+
+func (m *Manager) validateSMSProviderKey(ctx context.Context, provider string) error {
+	switch provider {
+	case smsprovider.SMSBower:
+		cfg, err := m.settings.GetSMSBower(ctx)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(cfg.APIKey) == "" {
+			return fmt.Errorf("SMSBower API Key 尚未配置")
+		}
+	case smsprovider.HeroSMS:
+		cfg, err := m.settings.GetHeroSMS(ctx)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(cfg.APIKey) == "" {
+			return fmt.Errorf("HeroSMS API Key 尚未配置")
+		}
+	default:
+		return fmt.Errorf("%w: invalid sms_provider %q", storage.ErrInvalidInput, provider)
+	}
+	return nil
 }
 
 func (m *Manager) claimProxy(ctx context.Context, batch domain.Batch) (string, error) {
@@ -542,15 +573,9 @@ reserveSlots:
 }
 
 func (m *Manager) processPurchaseCleanupItem(ctx context.Context, item storage.PurchaseCleanupAttempt) {
-	var err error
-	if item.Provider != "smsbower" {
-		err = fmt.Errorf("unsupported purchase cleanup provider %q", item.Provider)
-	} else {
-		var client *smsbower.Client
-		client, err = m.smsClient(ctx)
-		if err == nil {
-			_, err = client.SetStatus(ctx, item.ProviderActivationID, smsbower.SetStatusCancel)
-		}
+	client, err := m.smsClient(ctx, item.Provider)
+	if err == nil {
+		_, err = client.SetStatus(ctx, item.ProviderActivationID, smsbower.SetStatusCancel)
 	}
 	if providerActionConcluded(err) {
 		if completeErr := m.store.CompletePurchaseCleanup(ctx, item.Token, item.LeaseOwner, item.LeaseVersion); completeErr != nil {
@@ -611,22 +636,47 @@ func (m *Manager) purchaseBatch(ctx context.Context, batch domain.Batch) {
 	m.purchaseOne(ctx, latest)
 }
 
-func (m *Manager) smsClient(ctx context.Context) (*smsbower.Client, error) {
-	cfg, err := m.settings.GetSMSBower(ctx)
+func (m *Manager) smsClient(ctx context.Context, provider string) (smsbower.API, error) {
+	provider, err := smsprovider.Normalize(provider)
 	if err != nil {
 		return nil, err
 	}
-	return smsbower.NewClient(smsbower.Config{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL})
+	switch provider {
+	case smsprovider.SMSBower:
+		cfg, getErr := m.settings.GetSMSBower(ctx)
+		if getErr != nil {
+			return nil, getErr
+		}
+		return smsbower.NewClient(smsbower.Config{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL})
+	case smsprovider.HeroSMS:
+		cfg, getErr := m.settings.GetHeroSMS(ctx)
+		if getErr != nil {
+			return nil, getErr
+		}
+		return herosms.NewClient(herosms.Config{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL})
+	default:
+		return nil, fmt.Errorf("invalid sms_provider %q", provider)
+	}
 }
 
 func (m *Manager) purchaseOne(ctx context.Context, batch domain.Batch) {
-	client, err := m.smsClient(ctx)
+	var options BatchOptions
+	if len(batch.Config) != 0 {
+		if err := json.Unmarshal(batch.Config, &options); err != nil {
+			m.noteBatchError(ctx, batch, err)
+			return
+		}
+	}
+	provider, err := smsprovider.Normalize(options.SMSProvider)
 	if err != nil {
 		m.noteBatchError(ctx, batch, err)
 		return
 	}
-	var options BatchOptions
-	_ = json.Unmarshal(batch.Config, &options)
+	client, err := m.smsClient(ctx, provider)
+	if err != nil {
+		m.noteBatchError(ctx, batch, err)
+		return
+	}
 	country, err := strconv.Atoi(batch.CountryCode)
 	if err != nil {
 		m.noteBatchError(ctx, batch, fmt.Errorf("invalid country ID %q", batch.CountryCode))
@@ -669,9 +719,9 @@ func (m *Manager) purchaseOne(ctx context.Context, batch domain.Batch) {
 	})
 	if err != nil {
 		if errors.Is(err, smsbower.ErrPurchaseUnknown) {
-			m.logger.Error("SMSBower purchase result is unknown; stopping batch to prevent a duplicate purchase", "batch_id", batch.ID, "error", err)
+			m.logger.Error("SMS provider purchase result is unknown; stopping batch to prevent a duplicate purchase", "batch_id", batch.ID, "provider", provider, "error", err)
 			reason := "购买结果未知，已停止自动补购以避免重复扣费: " + err.Error()
-			if _, freezeErr := m.freezePurchase(ctx, batch.ID, purchaseToken, "smsbower", "", reason); freezeErr != nil {
+			if _, freezeErr := m.freezePurchase(ctx, batch.ID, purchaseToken, provider, "", reason); freezeErr != nil {
 				m.logger.Error("freeze unknown purchase", "batch_id", batch.ID, "error", freezeErr)
 			}
 			return
@@ -681,7 +731,7 @@ func (m *Manager) purchaseOne(ctx context.Context, batch domain.Batch) {
 		if releaseErr := m.releasePurchase(ctx, batch.ID, purchaseToken, next, err.Error()); releaseErr != nil {
 			reason := "购买预占释放结果未知，已停止自动补购: " + releaseErr.Error()
 			m.logger.Error("release failed purchase reservation", "batch_id", batch.ID, "error", releaseErr)
-			if _, freezeErr := m.freezePurchase(ctx, batch.ID, purchaseToken, "smsbower", "", reason); freezeErr != nil &&
+			if _, freezeErr := m.freezePurchase(ctx, batch.ID, purchaseToken, provider, "", reason); freezeErr != nil &&
 				!errors.Is(freezeErr, storage.ErrConflict) {
 				m.logger.Error("freeze unreleased purchase", "batch_id", batch.ID, "error", freezeErr)
 			}
@@ -691,7 +741,7 @@ func (m *Manager) purchaseOne(ctx context.Context, batch domain.Batch) {
 	payload, _ := json.Marshal(purchased)
 	expires := time.Now().UTC().Add(m.cfg.ActivationTTL)
 	params := storage.CreateActivationParams{
-		PurchaseToken: purchaseToken, BatchID: batch.ID, Provider: "smsbower", ProviderActivationID: purchased.ActivationID,
+		PurchaseToken: purchaseToken, BatchID: batch.ID, Provider: provider, ProviderActivationID: purchased.ActivationID,
 		PhoneNumber: purchased.PhoneNumber, ServiceCode: batch.ServiceCode, CountryCode: batch.CountryCode,
 		Operator: purchased.Operator, PurchasePriceAmount: firstNonEmpty(purchased.Cost, batch.MaxPriceAmount),
 		Currency: firstNonEmpty(purchased.Currency, batch.Currency), ProviderPayload: payload,
@@ -699,8 +749,8 @@ func (m *Manager) purchaseOne(ctx context.Context, batch domain.Batch) {
 	}
 	created, err := m.persistPurchasedActivation(ctx, params)
 	if err != nil {
-		reason := fmt.Sprintf("SMSBower 号码 %s 落库异常，已停止自动补购: %v", purchased.ActivationID, err)
-		resolvedState, freezeErr := m.freezePurchase(ctx, batch.ID, purchaseToken, "smsbower", purchased.ActivationID, reason)
+		reason := fmt.Sprintf("%s 号码 %s 落库异常，已停止自动补购: %v", provider, purchased.ActivationID, err)
+		resolvedState, freezeErr := m.freezePurchase(ctx, batch.ID, purchaseToken, provider, purchased.ActivationID, reason)
 		if freezeErr != nil {
 			m.logger.Error("freeze unpersisted purchase", "batch_id", batch.ID, "provider_id", purchased.ActivationID, "error", freezeErr)
 			return
@@ -835,7 +885,13 @@ func (m *Manager) processActivation(ctx context.Context, activation domain.Activ
 	defer releaseAccount()
 
 	var err error
-	if activation.ControlAction != domain.ControlActionNone {
+	// Once GoPay has consumed the PIN submission and blocked the account, the
+	// normal worker path owes the SMS number a provider completion. Explicit
+	// user control actions still retain their usual semantics.
+	if activation.Status == domain.ActivationStatusPINSubmissionBlocked &&
+		activation.ControlAction == domain.ControlActionNone {
+		err = m.finalizeProviderAction(ctx, activation, smsbower.SetStatusComplete)
+	} else if activation.ControlAction != domain.ControlActionNone {
 		err = m.processControl(ctx, activation)
 	} else {
 		switch activation.Status {
@@ -846,15 +902,12 @@ func (m *Manager) processActivation(ctx context.Context, activation domain.Activ
 				err = m.probeAndStartLogin(ctx, activation)
 			}
 		case domain.ActivationStatusDuplicate, domain.ActivationStatusPINRequired, domain.ActivationStatusUnregistered,
-			domain.ActivationStatusLoginFailed, domain.ActivationStatusLoginCodeTimeout:
+			domain.ActivationStatusLoginFailed, domain.ActivationStatusLoginCodeTimeout,
+			domain.ActivationStatusPINCodeTimeout:
 			err = m.finalizeProviderAction(ctx, activation, smsbower.SetStatusCancel)
 		case domain.ActivationStatusAwaitingLoginCode:
 			if m.activationExpired(activation) {
 				err = m.expireAndCancel(ctx, activation)
-			} else if loginCodeWaitTimedOut(activation, time.Now().UTC()) {
-				err = m.cancelAndClassifyFrom(ctx, activation,
-					[]domain.ActivationStatus{domain.ActivationStatusAwaitingLoginCode},
-					domain.ActivationStatusLoginCodeTimeout, "等待验证码超时")
 			} else {
 				err = m.pollLoginCode(ctx, activation)
 			}
@@ -896,7 +949,7 @@ func (m *Manager) processActivation(ctx context.Context, activation domain.Activ
 			_, err = m.store.TransitionActivationOwned(ctx, activation.ID, nil, domain.ActivationStatusFailed, "unsupported workflow state: "+string(activation.Status), activation.LeaseOwner, activation.LeaseVersion)
 		}
 	}
-	err = m.finalizeLoginFailure(ctx, activation, err)
+	err = m.finalizeLoginFailure(ctx, &activation, err)
 	if err != nil {
 		m.logger.Warn("activation step failed", "activation_id", activation.ID, "state", activation.Status, "error", err)
 		// Keep the last actionable reason with the activation so the dashboard
@@ -922,11 +975,24 @@ func (m *Manager) processActivation(ctx context.Context, activation domain.Activ
 	}
 }
 
-func (m *Manager) finalizeLoginFailure(ctx context.Context, activation domain.Activation, err error) error {
+func (m *Manager) finalizeLoginFailure(ctx context.Context, activation *domain.Activation, err error) error {
 	if !errors.Is(err, gopay.ErrLoginFailed) {
 		return err
 	}
-	return m.cancelAndClassify(ctx, activation, domain.ActivationStatusLoginFailed, loginFailureReason(activation.Status, err))
+	reason := loginFailureReason(activation.Status, err)
+	if pinSubmissionBlockedFailure(activation.Status, err) {
+		_, transitionErr := m.store.TransitionActivationOwned(ctx, activation.ID,
+			[]domain.ActivationStatus{domain.ActivationStatusSettingPIN},
+			domain.ActivationStatusPINSubmissionBlocked, reason,
+			activation.LeaseOwner, activation.LeaseVersion)
+		if transitionErr != nil {
+			return transitionErr
+		}
+		activation.Status = domain.ActivationStatusPINSubmissionBlocked
+		activation.FailureReason = reason
+		return m.finalizeProviderAction(ctx, *activation, smsbower.SetStatusComplete)
+	}
+	return m.cancelAndClassify(ctx, *activation, domain.ActivationStatusLoginFailed, reason)
 }
 
 func (m *Manager) acquireAccountSessionLock(ctx context.Context, phone string) (func(), error) {
@@ -1010,15 +1076,12 @@ func (m *Manager) activationExpired(activation domain.Activation) bool {
 	return activation.ProviderExpiresAt != nil && time.Now().UTC().After(*activation.ProviderExpiresAt)
 }
 
-func loginCodeWaitTimedOut(activation domain.Activation, now time.Time) bool {
-	if activation.Status != domain.ActivationStatusAwaitingLoginCode || activation.StatusChangedAt.IsZero() {
-		return false
-	}
-	return now.After(activation.StatusChangedAt.Add(loginCodeWaitTimeout))
+func verificationCodeWaitTimedOut(sentAt, now time.Time) bool {
+	return !sentAt.IsZero() && now.After(sentAt.Add(verificationCodeWait))
 }
 
 func (m *Manager) expireAndCancel(ctx context.Context, activation domain.Activation) error {
-	client, err := m.smsClient(ctx)
+	client, err := m.smsClient(ctx, activation.Provider)
 	if err != nil {
 		return err
 	}
@@ -1034,7 +1097,7 @@ func providerActionConcluded(err error) bool {
 }
 
 func (m *Manager) processControl(ctx context.Context, activation domain.Activation) error {
-	client, err := m.smsClient(ctx)
+	client, err := m.smsClient(ctx, activation.Provider)
 	if err != nil {
 		return err
 	}
@@ -1107,6 +1170,8 @@ func (m *Manager) probeAndStartLogin(ctx context.Context, activation domain.Acti
 	}
 	state := client.State()
 	state.SMSCycle = activation.SMSCycle
+	state.LoginCodeSentAt = time.Now().UTC()
+	state.LoginCodeResends = 0
 	client.Restore(state)
 	account, err := m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPending, nil)
 	if err != nil {
@@ -1140,7 +1205,7 @@ func (m *Manager) cancelAndClassifyFrom(
 }
 
 func (m *Manager) finalizeProviderAction(ctx context.Context, activation domain.Activation, action smsbower.SetStatus) error {
-	client, err := m.smsClient(ctx)
+	client, err := m.smsClient(ctx, activation.Provider)
 	if err != nil {
 		return err
 	}
@@ -1166,32 +1231,169 @@ func (m *Manager) pollLoginCode(ctx context.Context, activation domain.Activatio
 	case gopay.LoginStageAuthenticated:
 		_, err = m.store.TransitionActivationOwned(ctx, activation.ID, []domain.ActivationStatus{domain.ActivationStatusAwaitingLoginCode}, domain.ActivationStatusCheckingBalance, "", activation.LeaseOwner, activation.LeaseVersion)
 		return err
-	case gopay.LoginStageReady2FA:
+	case gopay.LoginStageReady1FA, gopay.LoginStageReady2FA:
+		// Ready2FA also represents a brand-new challenge after 1FA. Only
+		// re-check the provider when this ready state came from an elapsed wait;
+		// otherwise the previous cycle's login code may still be visible.
+		if !state.LoginCodeSentAt.IsZero() {
+			status, pollErr := m.pollStatus(ctx, activation)
+			if pollErr != nil {
+				return pollErr
+			}
+			code, received := providerVerificationCode(status)
+			if received && !state.LoginCodeDispatchUncertain {
+				return m.consumeLoginVerificationCode(ctx, activation, client, targetPIN, code)
+			}
+			if status.Kind == smsbower.StatusOK && !received {
+				return fmt.Errorf("SMSBower returned an empty login verification code")
+			}
+			// A code returned for an uncertain dispatch belongs to a token which
+			// may never have reached durable storage. The timeout has already
+			// elapsed in a ready state, so abandon that code and advance to the
+			// next counted attempt instead of retrying it with the older token.
+			if !providerStillWaiting(status.Kind) && !(received && state.LoginCodeDispatchUncertain) {
+				return nil
+			}
+		}
 		cycle := activation.SMSCycle
 		if state.SMSCycle >= activation.SMSCycle {
-			cycle, err = m.requestAnother(ctx, activation)
+			cycle, state, err = m.advanceVerificationSMSCycle(ctx, activation, state, func(checkpoint gopay.Session) error {
+				_, saveErr := m.saveSession(ctx, activation.PhoneNumber, checkpoint, targetPIN, domain.AccountStatusPending, nil)
+				return saveErr
+			})
 			if err != nil {
 				return err
 			}
 		}
-		state.LoginStage = gopay.LoginStageCycleReady2FA
+		if state.LoginStage == gopay.LoginStageReady1FA {
+			state.LoginStage = gopay.LoginStageCycleReady1FA
+		} else {
+			state.LoginStage = gopay.LoginStageCycleReady2FA
+		}
 		state.SMSCycle = cycle
+		state.VerificationCycleRequest = gopay.VerificationCycleRequestNone
 		client.Restore(state)
 		_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPending, nil)
 		return err
-	case gopay.LoginStageCycleReady2FA:
-		if _, err = client.StartNextLoginOTP(ctx); err != nil {
+	case gopay.LoginStageCycleReady1FA, gopay.LoginStageCycleReady2FA:
+		// Persist the attempt before the non-idempotent GoPay call. If the
+		// process stops after dispatch, recovery waits for this attempt instead
+		// of sending an uncounted duplicate. Until the newly returned OTP token
+		// is saved, any code received for this dispatch is deliberately treated
+		// as unusable rather than verified with the previous token.
+		pending := state
+		if state.LoginStage == gopay.LoginStageCycleReady1FA {
+			pending.LoginStage = gopay.LoginStageAwaiting1FAOTP
+		} else {
+			pending.LoginStage = gopay.LoginStageAwaiting2FAOTP
+		}
+		pending.LoginCodeDispatchUncertain = true
+		// The OTP has not been acknowledged yet. Leave the wait anchor empty so
+		// a timeout or process interruption receives a fresh, conservative
+		// 60-second window when recovery first observes the uncertain dispatch.
+		pending.LoginCodeSentAt = time.Time{}
+		if _, err = m.saveSession(ctx, activation.PhoneNumber, pending, targetPIN, domain.AccountStatusPending, nil); err != nil {
 			return err
 		}
+		if state.LoginStage == gopay.LoginStageCycleReady1FA {
+			_, err = client.StartLogin(ctx)
+		} else {
+			_, err = client.StartNextLoginOTP(ctx)
+		}
+		if err != nil {
+			return err
+		}
+		state = client.State()
+		state.LoginCodeSentAt = time.Now().UTC()
+		state.LoginCodeDispatchUncertain = false
+		client.Restore(state)
 		_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPending, nil)
 		return err
 	}
 
 	status, err := m.pollStatus(ctx, activation)
-	if err != nil || status.Kind != smsbower.StatusOK {
+	if err != nil {
 		return err
 	}
-	storedCode, err := m.appendCode(ctx, activation, domain.VerificationPhaseLogin, status.Code)
+	code, received := providerVerificationCode(status)
+	if received && !state.LoginCodeDispatchUncertain {
+		return m.consumeLoginVerificationCode(ctx, activation, client, targetPIN, code)
+	}
+	if !received {
+		if status.Kind == smsbower.StatusOK {
+			return fmt.Errorf("SMSBower returned an empty login verification code")
+		}
+		if !providerStillWaiting(status.Kind) {
+			return nil
+		}
+		now := time.Now().UTC()
+		if state.LoginCodeSentAt.IsZero() {
+			state.LoginCodeSentAt = now
+			client.Restore(state)
+			_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPending, nil)
+			return err
+		}
+		if !verificationCodeWaitTimedOut(state.LoginCodeSentAt, now) {
+			return nil
+		}
+	}
+	// A successful provider response can still be unusable after a process or
+	// database failure between GoPay dispatch and saving the new OTP token. It
+	// remains one counted attempt and observes the same full 60-second window.
+	now := time.Now().UTC()
+	if state.LoginCodeSentAt.IsZero() {
+		state.LoginCodeSentAt = now
+		client.Restore(state)
+		if _, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPending, nil); err != nil {
+			return err
+		}
+	}
+	if !verificationCodeWaitTimedOut(state.LoginCodeSentAt, now) {
+		if received && status.Kind == smsbower.StatusOK {
+			return m.store.TouchActivationPoll(ctx, activation.ID, activation.LeaseOwner, now, now.Add(m.cfg.PollInterval))
+		}
+		return nil
+	}
+	if state.LoginCodeResends >= verificationCodeResends {
+		return m.cancelAndClassifyFrom(ctx, activation,
+			[]domain.ActivationStatus{domain.ActivationStatusAwaitingLoginCode},
+			domain.ActivationStatusLoginCodeTimeout,
+			"登录验证码重发 3 次后仍未收到")
+	}
+	switch state.LoginStage {
+	case gopay.LoginStageAwaiting1FAOTP:
+		state.LoginStage = gopay.LoginStageReady1FA
+	case gopay.LoginStageAwaiting2FAOTP:
+		state.LoginStage = gopay.LoginStageReady2FA
+	default:
+		return fmt.Errorf("unexpected login OTP wait stage %q", state.LoginStage)
+	}
+	state.LoginCodeResends++
+	client.Restore(state)
+	_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPending, nil)
+	return err
+}
+
+func (m *Manager) consumeLoginVerificationCode(
+	ctx context.Context,
+	activation domain.Activation,
+	client *gopay.Client,
+	targetPIN string,
+	code string,
+) error {
+	state := client.State()
+	// A timeout is durably represented by a ready stage. If the previous code
+	// arrives during the final provider re-check, restore its awaiting stage so
+	// the GoPay verifier can still consume that challenge.
+	switch state.LoginStage {
+	case gopay.LoginStageReady1FA:
+		state.LoginStage = gopay.LoginStageAwaiting1FAOTP
+		client.Restore(state)
+	case gopay.LoginStageReady2FA:
+		state.LoginStage = gopay.LoginStageAwaiting2FAOTP
+		client.Restore(state)
+	}
+	storedCode, err := m.appendCode(ctx, activation, domain.VerificationPhaseLogin, code)
 	if err != nil {
 		return err
 	}
@@ -1200,7 +1402,20 @@ func (m *Manager) pollLoginCode(ctx context.Context, activation domain.Activatio
 		return err
 	}
 	state = client.State()
-	state.SMSCycle = activation.SMSCycle
+	if state.SMSCycle < activation.SMSCycle {
+		state.SMSCycle = activation.SMSCycle
+	}
+	if result.NeedsOTP {
+		state.LoginCodeSentAt = time.Time{}
+		state.LoginCodeResends = 0
+		state.LoginCodeDispatchUncertain = false
+		state.VerificationCycleRequest = gopay.VerificationCycleRequestNone
+	} else if result.Authenticated {
+		state.LoginCodeSentAt = time.Time{}
+		state.LoginCodeResends = 0
+		state.LoginCodeDispatchUncertain = false
+		state.VerificationCycleRequest = gopay.VerificationCycleRequestNone
+	}
 	client.Restore(state)
 	accountStatus := domain.AccountStatusPending
 	if result.Authenticated {
@@ -1213,6 +1428,28 @@ func (m *Manager) pollLoginCode(ctx context.Context, activation domain.Activatio
 		return fmt.Errorf("GoPay login did not authenticate")
 	}
 	return nil
+}
+
+func providerVerificationCode(status smsbower.ActivationStatus) (string, bool) {
+	code := strings.TrimSpace(status.Code)
+	if code == "" {
+		return "", false
+	}
+	switch status.Kind {
+	case smsbower.StatusOK, smsbower.StatusWaitRetry, smsbower.StatusWaitResend:
+		return code, true
+	default:
+		return "", false
+	}
+}
+
+func providerStillWaiting(kind smsbower.StatusKind) bool {
+	switch kind {
+	case smsbower.StatusWaitCode, smsbower.StatusWaitRetry, smsbower.StatusWaitResend, smsbower.StatusUnknown:
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *Manager) checkBalance(ctx context.Context, activation domain.Activation) error {
@@ -1286,6 +1523,10 @@ func (m *Manager) checkBalance(ctx context.Context, activation domain.Activation
 	state := client.State()
 	state.PINStage = pinStage
 	state.SMSCycle = activation.SMSCycle
+	state.PINCodeSentAt = time.Time{}
+	state.PINCodeResends = 0
+	state.PINCodeDispatchUncertain = false
+	state.VerificationCycleRequest = gopay.VerificationCycleRequestNone
 	client.Restore(state)
 	if _, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, &amount); err != nil {
 		return err
@@ -1306,23 +1547,48 @@ func (m *Manager) pollPINCode(ctx context.Context, activation domain.Activation)
 	state := client.State()
 	switch state.PINStage {
 	case gopay.PINStageReadyCycle:
+		if !state.PINCodeSentAt.IsZero() {
+			status, pollErr := m.pollStatus(ctx, activation)
+			if pollErr != nil {
+				return pollErr
+			}
+			code, received := providerVerificationCode(status)
+			if received && !state.PINCodeDispatchUncertain {
+				return m.consumePINVerificationCode(ctx, activation, client, targetPIN, code)
+			}
+			if status.Kind == smsbower.StatusOK && !received {
+				return fmt.Errorf("SMSBower returned an empty PIN verification code")
+			}
+			if !providerStillWaiting(status.Kind) && !(received && state.PINCodeDispatchUncertain) {
+				return nil
+			}
+		}
 		cycle := activation.SMSCycle
 		if state.SMSCycle >= activation.SMSCycle {
-			cycle, err = m.requestAnother(ctx, activation)
+			cycle, state, err = m.advanceVerificationSMSCycle(ctx, activation, state, func(checkpoint gopay.Session) error {
+				_, saveErr := m.saveSession(ctx, activation.PhoneNumber, checkpoint, targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
+				return saveErr
+			})
 			if err != nil {
 				return err
 			}
 		}
 		state.PINStage = gopay.PINStageCycleReady
 		state.SMSCycle = cycle
+		state.VerificationCycleRequest = gopay.VerificationCycleRequestNone
 		client.Restore(state)
 		_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
 		return err
 	case gopay.PINStageCycleReady:
+		if err = m.savePINDispatchCheckpoint(ctx, activation, state, targetPIN, gopay.PINStageAwaiting); err != nil {
+			return err
+		}
 		if _, err = client.StartPINSetup(ctx, targetPIN); err != nil {
 			if isHTTPStatus(err, 401) {
-				if refreshErr := m.refreshAndPersistSession(ctx, activation, client, targetPIN, domain.AccountStatusPINPending, activation.BalanceRP); refreshErr != nil {
+				if refreshErr := client.Refresh(ctx); refreshErr != nil {
 					err = refreshErr
+				} else if checkpointErr := m.savePINDispatchCheckpoint(ctx, activation, client.State(), targetPIN, gopay.PINStageAwaiting); checkpointErr != nil {
+					err = checkpointErr
 				} else {
 					_, err = client.StartPINSetup(ctx, targetPIN)
 				}
@@ -1334,26 +1600,55 @@ func (m *Manager) pollPINCode(ctx context.Context, activation domain.Activation)
 				return err
 			}
 		}
+		state = client.State()
+		state.PINCodeSentAt = time.Now().UTC()
+		state.PINCodeDispatchUncertain = false
+		client.Restore(state)
 		_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
 		return err
 	case gopay.PINStageResetReadyCycle:
+		if !state.PINCodeSentAt.IsZero() {
+			status, pollErr := m.pollStatus(ctx, activation)
+			if pollErr != nil {
+				return pollErr
+			}
+			code, received := providerVerificationCode(status)
+			if received && !state.PINCodeDispatchUncertain {
+				return m.consumePINVerificationCode(ctx, activation, client, targetPIN, code)
+			}
+			if status.Kind == smsbower.StatusOK && !received {
+				return fmt.Errorf("SMSBower returned an empty PIN verification code")
+			}
+			if !providerStillWaiting(status.Kind) && !(received && state.PINCodeDispatchUncertain) {
+				return nil
+			}
+		}
 		cycle := activation.SMSCycle
 		if state.SMSCycle >= activation.SMSCycle {
-			cycle, err = m.requestAnother(ctx, activation)
+			cycle, state, err = m.advanceVerificationSMSCycle(ctx, activation, state, func(checkpoint gopay.Session) error {
+				_, saveErr := m.saveSession(ctx, activation.PhoneNumber, checkpoint, targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
+				return saveErr
+			})
 			if err != nil {
 				return err
 			}
 		}
 		state.PINStage = gopay.PINStageResetCycleReady
 		state.SMSCycle = cycle
+		state.VerificationCycleRequest = gopay.VerificationCycleRequestNone
 		client.Restore(state)
 		_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
 		return err
 	case gopay.PINStageResetCycleReady:
+		if err = m.savePINDispatchCheckpoint(ctx, activation, state, targetPIN, gopay.PINStageResetAwaiting); err != nil {
+			return err
+		}
 		if _, err = client.StartPINReset(ctx, targetPIN); err != nil {
 			if isHTTPStatus(err, 401) {
-				if refreshErr := m.refreshAndPersistSession(ctx, activation, client, targetPIN, domain.AccountStatusPINPending, activation.BalanceRP); refreshErr != nil {
+				if refreshErr := client.Refresh(ctx); refreshErr != nil {
 					err = refreshErr
+				} else if checkpointErr := m.savePINDispatchCheckpoint(ctx, activation, client.State(), targetPIN, gopay.PINStageResetAwaiting); checkpointErr != nil {
+					err = checkpointErr
 				} else {
 					_, err = client.StartPINReset(ctx, targetPIN)
 				}
@@ -1362,6 +1657,10 @@ func (m *Manager) pollPINCode(ctx context.Context, activation domain.Activation)
 				return err
 			}
 		}
+		state = client.State()
+		state.PINCodeSentAt = time.Now().UTC()
+		state.PINCodeDispatchUncertain = false
+		client.Restore(state)
 		_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
 		return err
 	case gopay.PINStageSetupVerified, gopay.PINStageResetVerified, gopay.PINStageComplete:
@@ -1369,10 +1668,96 @@ func (m *Manager) pollPINCode(ctx context.Context, activation domain.Activation)
 	}
 
 	status, err := m.pollStatus(ctx, activation)
-	if err != nil || status.Kind != smsbower.StatusOK {
+	if err != nil {
 		return err
 	}
-	storedCode, err := m.appendCode(ctx, activation, domain.VerificationPhasePIN, status.Code)
+	code, received := providerVerificationCode(status)
+	if received && !state.PINCodeDispatchUncertain {
+		return m.consumePINVerificationCode(ctx, activation, client, targetPIN, code)
+	}
+	if !received {
+		if status.Kind == smsbower.StatusOK {
+			return fmt.Errorf("SMSBower returned an empty PIN verification code")
+		}
+		if !providerStillWaiting(status.Kind) {
+			return nil
+		}
+		now := time.Now().UTC()
+		if state.PINCodeSentAt.IsZero() {
+			state.PINCodeSentAt = now
+			client.Restore(state)
+			_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
+			return err
+		}
+		if !verificationCodeWaitTimedOut(state.PINCodeSentAt, now) {
+			return nil
+		}
+	}
+	now := time.Now().UTC()
+	if state.PINCodeSentAt.IsZero() {
+		state.PINCodeSentAt = now
+		client.Restore(state)
+		if _, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP); err != nil {
+			return err
+		}
+	}
+	if !verificationCodeWaitTimedOut(state.PINCodeSentAt, now) {
+		if received && status.Kind == smsbower.StatusOK {
+			return m.store.TouchActivationPoll(ctx, activation.ID, activation.LeaseOwner, now, now.Add(m.cfg.PollInterval))
+		}
+		return nil
+	}
+	if state.PINCodeResends >= verificationCodeResends {
+		return m.cancelAndClassifyFrom(ctx, activation,
+			[]domain.ActivationStatus{domain.ActivationStatusAwaitingPINCode},
+			domain.ActivationStatusPINCodeTimeout,
+			"改 PIN 验证码重发 3 次后仍未收到")
+	}
+	switch state.PINStage {
+	case gopay.PINStageAwaiting:
+		state.PINStage = gopay.PINStageReadyCycle
+	case gopay.PINStageResetAwaiting:
+		state.PINStage = gopay.PINStageResetReadyCycle
+	default:
+		return fmt.Errorf("unexpected PIN OTP wait stage %q", state.PINStage)
+	}
+	state.PINCodeResends++
+	client.Restore(state)
+	_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
+	return err
+}
+
+func (m *Manager) savePINDispatchCheckpoint(
+	ctx context.Context,
+	activation domain.Activation,
+	state gopay.Session,
+	targetPIN string,
+	awaitingStage gopay.PINStage,
+) error {
+	state.PINStage = awaitingStage
+	state.PINCodeSentAt = time.Time{}
+	state.PINCodeDispatchUncertain = true
+	_, err := m.saveSession(ctx, activation.PhoneNumber, state, targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
+	return err
+}
+
+func (m *Manager) consumePINVerificationCode(
+	ctx context.Context,
+	activation domain.Activation,
+	client *gopay.Client,
+	targetPIN string,
+	code string,
+) error {
+	state := client.State()
+	switch state.PINStage {
+	case gopay.PINStageReadyCycle:
+		state.PINStage = gopay.PINStageAwaiting
+		client.Restore(state)
+	case gopay.PINStageResetReadyCycle:
+		state.PINStage = gopay.PINStageResetAwaiting
+		client.Restore(state)
+	}
+	storedCode, err := m.appendCode(ctx, activation, domain.VerificationPhasePIN, code)
 	if err != nil {
 		return err
 	}
@@ -1407,7 +1792,13 @@ func (m *Manager) pollPINCode(ctx context.Context, activation domain.Activation)
 		return err
 	}
 	state = client.State()
-	state.SMSCycle = activation.SMSCycle
+	if state.SMSCycle < activation.SMSCycle {
+		state.SMSCycle = activation.SMSCycle
+	}
+	state.PINCodeSentAt = time.Time{}
+	state.PINCodeResends = 0
+	state.PINCodeDispatchUncertain = false
+	state.VerificationCycleRequest = gopay.VerificationCycleRequestNone
 	client.Restore(state)
 	if _, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP); err != nil {
 		return err
@@ -1437,6 +1828,10 @@ func (m *Manager) preparePINReset(ctx context.Context, activation domain.Activat
 	state.PINVerificationToken = ""
 	state.PINChallengeID = ""
 	state.PINClientID = ""
+	state.PINCodeSentAt = time.Time{}
+	state.PINCodeResends = 0
+	state.PINCodeDispatchUncertain = false
+	state.VerificationCycleRequest = gopay.VerificationCycleRequestNone
 	client.Restore(state)
 	_, err := m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
 	return err
@@ -1454,6 +1849,10 @@ func (m *Manager) recoverExpiredPINVerification(ctx context.Context, activation 
 	state.PINVerificationToken = ""
 	state.PINChallengeID = ""
 	state.PINClientID = ""
+	state.PINCodeSentAt = time.Time{}
+	state.PINCodeResends = 0
+	state.PINCodeDispatchUncertain = false
+	state.VerificationCycleRequest = gopay.VerificationCycleRequestNone
 	client.Restore(state)
 	_, err := m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
 	return err
@@ -1562,7 +1961,7 @@ func (m *Manager) pollFollowupCode(ctx context.Context, activation domain.Activa
 }
 
 func (m *Manager) pollStatus(ctx context.Context, activation domain.Activation) (smsbower.ActivationStatus, error) {
-	client, err := m.smsClient(ctx)
+	client, err := m.smsClient(ctx, activation.Provider)
 	if err != nil {
 		return smsbower.ActivationStatus{}, err
 	}
@@ -1575,17 +1974,17 @@ func (m *Manager) pollStatus(ctx context.Context, activation domain.Activation) 
 	case smsbower.StatusWaitCode, smsbower.StatusWaitRetry, smsbower.StatusWaitResend, smsbower.StatusUnknown:
 		return status, m.store.TouchActivationPoll(ctx, activation.ID, activation.LeaseOwner, now, now.Add(m.cfg.PollInterval))
 	case smsbower.StatusCancel:
-		_, err = m.store.TransitionActivationOwned(ctx, activation.ID, nil, domain.ActivationStatusExpired, "SMSBower 激活已结束", activation.LeaseOwner, activation.LeaseVersion)
+		_, err = m.store.TransitionActivationOwned(ctx, activation.ID, nil, domain.ActivationStatusExpired, "短信激活已结束", activation.LeaseOwner, activation.LeaseVersion)
 		return status, err
 	case smsbower.StatusOK:
 		return status, nil
 	default:
-		return status, fmt.Errorf("unknown SMSBower status %q", status.Kind)
+		return status, fmt.Errorf("unknown SMS provider status %q", status.Kind)
 	}
 }
 
 func (m *Manager) requestAnother(ctx context.Context, activation domain.Activation) (int, error) {
-	client, err := m.smsClient(ctx)
+	client, err := m.smsClient(ctx, activation.Provider)
 	if err != nil {
 		return 0, err
 	}
@@ -1593,6 +1992,98 @@ func (m *Manager) requestAnother(ctx context.Context, activation domain.Activati
 		return 0, err
 	}
 	return m.store.AdvanceSMSCycle(ctx, activation.ID, activation.LeaseOwner, time.Now().UTC().Add(m.cfg.PollInterval))
+}
+
+// advanceVerificationSMSCycle makes the provider's non-idempotent
+// setStatus=3 request recoverable. The dispatching checkpoint is written
+// before the call, the accepted checkpoint before the local cycle update, and
+// the caller persists the cleared state together with its next GoPay stage.
+// A BAD_STATUS is accepted only while recovering a previously persisted,
+// outcome-uncertain dispatch; a first-call BAD_STATUS remains a real rejection
+// so a code racing with the request can still be observed on the next poll.
+func (m *Manager) advanceVerificationSMSCycle(
+	ctx context.Context,
+	activation domain.Activation,
+	state gopay.Session,
+	persist func(gopay.Session) error,
+) (int, gopay.Session, error) {
+	// Construct and validate the local provider client before persisting an
+	// external-call intent. Configuration failures are known not to have sent a
+	// request and therefore must not enter ambiguous-dispatch recovery.
+	client, err := m.smsClient(ctx, activation.Provider)
+	if err != nil {
+		return 0, state, err
+	}
+	recovering := false
+	switch state.VerificationCycleRequest {
+	case gopay.VerificationCycleRequestNone:
+		state.VerificationCycleRequest = gopay.VerificationCycleRequestDispatching
+		if err := persistVerificationCycleCheckpoint(ctx, persist, state); err != nil {
+			return 0, state, err
+		}
+	case gopay.VerificationCycleRequestDispatching:
+		recovering = true
+	case gopay.VerificationCycleRequestAccepted:
+		cycle, err := m.store.AdvanceSMSCycle(ctx, activation.ID, activation.LeaseOwner, time.Now().UTC().Add(m.cfg.PollInterval))
+		if err != nil {
+			return 0, state, err
+		}
+		state.VerificationCycleRequest = gopay.VerificationCycleRequestNone
+		return cycle, state, nil
+	default:
+		return 0, state, fmt.Errorf("unexpected verification cycle request state %q", state.VerificationCycleRequest)
+	}
+
+	_, err = client.SetStatus(ctx, activation.ProviderActivationID, smsbower.SetStatusRequestAnother)
+	if err != nil && !(recovering && smsbower.IsAPIError(err, "BAD_STATUS")) {
+		if !recovering && smsbower.IsAPIError(err, "BAD_STATUS") {
+			state.VerificationCycleRequest = gopay.VerificationCycleRequestNone
+			if saveErr := persistVerificationCycleCheckpoint(ctx, persist, state); saveErr != nil {
+				return 0, state, errors.Join(err, saveErr)
+			}
+		}
+		return 0, state, err
+	}
+
+	state.VerificationCycleRequest = gopay.VerificationCycleRequestAccepted
+	if err = persistVerificationCycleCheckpoint(ctx, persist, state); err != nil {
+		return 0, state, err
+	}
+	cycle, err := m.store.AdvanceSMSCycle(ctx, activation.ID, activation.LeaseOwner, time.Now().UTC().Add(m.cfg.PollInterval))
+	if err != nil {
+		return 0, state, err
+	}
+	state.VerificationCycleRequest = gopay.VerificationCycleRequestNone
+	return cycle, state, nil
+}
+
+func persistVerificationCycleCheckpoint(
+	ctx context.Context,
+	persist func(gopay.Session) error,
+	state gopay.Session,
+) error {
+	var err error
+	for attempt := 0; attempt < verificationCheckpointSaves; attempt++ {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if err = persist(state); err == nil {
+			return nil
+		}
+		if errors.Is(err, storage.ErrConflict) {
+			return err
+		}
+		if attempt+1 < verificationCheckpointSaves {
+			timer := time.NewTimer(verificationCheckpointRetry)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return err
 }
 
 func (m *Manager) appendCode(ctx context.Context, activation domain.Activation, phase domain.VerificationPhase, code string) (string, error) {
@@ -1698,6 +2189,9 @@ func (m *Manager) targetPIN(batch domain.Batch) (string, error) {
 func gopayCountryCode(activation domain.Activation, batch domain.Batch) string {
 	var provider smsbower.Activation
 	if json.Unmarshal(activation.ProviderPayload, &provider) == nil {
+		if value := normalizeDialCode(provider.CountryPhoneCode); value != "" {
+			return value
+		}
 		if value := normalizeDialCode(provider.CountryCode); value != "" {
 			return value
 		}

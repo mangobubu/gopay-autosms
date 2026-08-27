@@ -272,12 +272,13 @@ func parseActivation(action string, body []byte) (Activation, error) {
 	cost, _ := recursiveString(root, "activationCost", "activation_cost", "cost", "price")
 	currency, _ := recursiveString(root, "currency", "currencyCode")
 	countryCode, _ := recursiveString(root, "countryCode", "country_code")
+	countryPhoneCode, _ := recursiveString(root, "countryPhoneCode", "country_phone_code")
 	operator, _ := recursiveString(root, "activationOperator", "activation_operator", "operator")
 	canAnother, _ := recursiveBool(root, "canGetAnotherSms", "can_get_another_sms")
 	timeText, _ := recursiveString(root, "activationTime", "activation_time", "createdAt")
 	return Activation{
 		ActivationID: id, PhoneNumber: normalizePhone(phone), Cost: cost,
-		Currency: currency, CountryCode: countryCode, CanGetAnotherSMS: canAnother,
+		Currency: currency, CountryCode: countryCode, CountryPhoneCode: countryPhoneCode, CanGetAnotherSMS: canAnother,
 		ActivatedAt: parseTime(timeText), Operator: operator, Raw: cloneRaw(body),
 	}, nil
 }

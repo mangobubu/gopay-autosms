@@ -8,8 +8,13 @@ export interface ActivationExpiryPresentation {
 const PROVIDER_CANCELLED_CLASSIFICATIONS = new Set([
   'duplicate',
   'login_code_timeout',
+  'pin_code_timeout',
   'pin_required',
   'unregistered',
+])
+
+const PROVIDER_SETTLED_CLASSIFICATIONS = new Set([
+  'pin_submission_blocked',
 ])
 
 function isCancelledActivation(status: string, finishedAt?: string): boolean {
@@ -25,6 +30,9 @@ export function activationExpiryPresentation(
 ): ActivationExpiryPresentation {
   if (isCancelledActivation(status, finishedAt)) {
     return { label: '已取消' }
+  }
+  if (finishedAt && PROVIDER_SETTLED_CLASSIFICATIONS.has(status)) {
+    return { label: '已结算' }
   }
 
   const countdown = formatCountdown(expiresAt, now)

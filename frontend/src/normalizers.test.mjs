@@ -7,6 +7,7 @@ import {
   batchStatus,
   normalizeAccountLoginStatuses,
   normalizeActivation,
+  normalizeActivations,
   normalizeBatch,
   normalizePrices,
 } from './normalizers.ts'
@@ -62,7 +63,15 @@ test('shows each durable PIN workflow status without inferring from historical c
 
 test('maps a login code timeout to a terminal danger status', () => {
   assert.deepEqual(activationStatus('login_code_timeout'), {
-    label: '等待验证码超时',
+    label: '登录验证码失败',
+    type: 'danger',
+    active: false,
+  })
+})
+
+test('maps a PIN code timeout to a terminal danger status', () => {
+  assert.deepEqual(activationStatus('pin_code_timeout'), {
+    label: '改 PIN 验证码失败',
     type: 'danger',
     active: false,
   })
@@ -78,6 +87,31 @@ test('keeps activation errors available while PIN setup is being processed', () 
 
   assert.equal(activation.pinCode, '9949')
   assert.equal(activation.error, 'PIN 设置失败')
+})
+
+test('pins numbers waiting for subsequent codes while preserving the API order', () => {
+  const activations = normalizeActivations({
+    activations: [
+      { id: 'newest', status: 'logging_in' },
+      { id: 'legacy-active', status: 'active' },
+      { id: 'pin-changed', status: 'pin_changed' },
+      { id: 'canonical-waiting', status: 'awaiting_subsequent_code' },
+      { id: 'legacy-polling', status: 'polling' },
+      { id: 'oldest', status: 'success' },
+    ],
+  })
+
+  assert.deepEqual(
+    activations.map(({ id }) => id),
+    [
+      'legacy-active',
+      'canonical-waiting',
+      'legacy-polling',
+      'newest',
+      'pin-changed',
+      'oldest',
+    ],
+  )
 })
 
 test('sorts priced offers from low to high and keeps unpriced offers last', () => {
@@ -130,6 +164,23 @@ test('normalizes and displays Bronze, Silver, and Gold provider tiers', () => {
   )
 })
 
+test('HeroSMS prices ignore provider and tier metadata', () => {
+  const offers = normalizePrices({
+    prices: [
+      { id: 'explicit', price: 1, tier: 'Gold', provider: 'hero-a' },
+      { id: 'pseudo-rank', price: 2, provider_rank: 2, provider: 'hero-b' },
+      { id: 'missing', price: 3, provider: 'hero-c' },
+    ],
+  }, { includeTiers: false, includeProviders: false, currencyLabel: '' })
+
+  assert.deepEqual(offers.map(({ provider }) => provider), [undefined, undefined, undefined])
+  assert.deepEqual(offers.map(({ tier }) => tier), [undefined, undefined, undefined])
+  assert.deepEqual(offers.map(({ tierDerived }) => tierDerived), [undefined, undefined, undefined])
+  assert.ok(offers.every(({ label }) => !/Bronze|Silver|Gold/.test(label)))
+  assert.ok(offers.every(({ label }) => !/hero-[abc]/.test(label)))
+  assert.ok(offers.every(({ label }) => !/USD|EUR|CNY|RUB|₽/.test(label)))
+})
+
 test('accepts supported tier aliases and ignores unknown values', () => {
   const aliases = [
     ['tier', 'Bronze', 'Bronze'],
@@ -153,6 +204,14 @@ test('accepts supported tier aliases and ignores unknown values', () => {
 test('shows explicit GoPay login failures as login failed', () => {
   assert.deepEqual(activationStatus('login_failed'), {
     label: '登录失败',
+    type: 'danger',
+    active: false,
+  })
+})
+
+test('shows blocked PIN submission as settled instead of successful', () => {
+  assert.deepEqual(activationStatus('pin_submission_blocked'), {
+    label: '新 PIN 提交受限',
     type: 'danger',
     active: false,
   })

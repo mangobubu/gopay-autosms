@@ -130,20 +130,20 @@ func newLoginCodeTimeoutManager(t *testing.T, store *loginCodeTimeoutStore, prov
 	)
 }
 
-func timedOutLoginCodeActivation() domain.Activation {
+func classifiedCodeTimeoutActivation(status domain.ActivationStatus, reason string) domain.Activation {
 	return domain.Activation{
 		ID:                   21,
 		BatchID:              11,
 		ProviderActivationID: "provider-activation-1",
 		PhoneNumber:          "+6281234567890",
-		Status:               domain.ActivationStatusAwaitingLoginCode,
-		StatusChangedAt:      time.Now().UTC().Add(-loginCodeWaitTimeout - time.Second),
+		Status:               status,
+		FailureReason:        reason,
 		LeaseOwner:           "worker-1",
 		LeaseVersion:         3,
 	}
 }
 
-func TestProcessActivationCancelsTimedOutLoginCode(t *testing.T) {
+func TestProcessActivationFinalizesClassifiedLoginCodeTimeout(t *testing.T) {
 	var cancelCalls atomic.Int32
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("action") != "setStatus" || r.URL.Query().Get("status") != "8" {
@@ -155,7 +155,10 @@ func TestProcessActivationCancelsTimedOutLoginCode(t *testing.T) {
 	}))
 	defer provider.Close()
 
-	activation := timedOutLoginCodeActivation()
+	activation := classifiedCodeTimeoutActivation(
+		domain.ActivationStatusLoginCodeTimeout,
+		"登录验证码重发 3 次后仍未收到",
+	)
 	store := &loginCodeTimeoutStore{currentStatus: activation.Status}
 	manager := newLoginCodeTimeoutManager(t, store, provider.URL)
 	manager.processActivation(context.Background(), activation)
@@ -167,13 +170,8 @@ func TestProcessActivationCancelsTimedOutLoginCode(t *testing.T) {
 	if got := cancelCalls.Load(); got != 1 {
 		t.Fatalf("provider cancellation calls = %d, want 1", got)
 	}
-	wantTransitions := []loginCodeTimeoutTransition{{
-		expected: []domain.ActivationStatus{domain.ActivationStatusAwaitingLoginCode},
-		next:     domain.ActivationStatusLoginCodeTimeout,
-		reason:   "等待验证码超时",
-	}}
-	if !reflect.DeepEqual(transitions, wantTransitions) {
-		t.Fatalf("transitions = %+v, want %+v", transitions, wantTransitions)
+	if len(transitions) != 0 {
+		t.Fatalf("transitions = %+v, want no reclassification", transitions)
 	}
 	wantFinalizations := [][]domain.ActivationStatus{{domain.ActivationStatusLoginCodeTimeout}}
 	if !reflect.DeepEqual(finalizations, wantFinalizations) {
@@ -181,86 +179,100 @@ func TestProcessActivationCancelsTimedOutLoginCode(t *testing.T) {
 	}
 }
 
-func TestLoginCodeWaitTimedOutUsesStrictPersistedBoundary(t *testing.T) {
+func TestVerificationCodeWaitTimedOutUsesStrictSixtySecondBoundary(t *testing.T) {
 	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
 		name         string
-		status       domain.ActivationStatus
-		changedAt    time.Time
+		sentAt       time.Time
 		wantTimedOut bool
 	}{
-		{name: "over 180 seconds", status: domain.ActivationStatusAwaitingLoginCode, changedAt: now.Add(-loginCodeWaitTimeout - time.Nanosecond), wantTimedOut: true},
-		{name: "exactly 180 seconds", status: domain.ActivationStatusAwaitingLoginCode, changedAt: now.Add(-loginCodeWaitTimeout)},
-		{name: "under 180 seconds", status: domain.ActivationStatusAwaitingLoginCode, changedAt: now.Add(-loginCodeWaitTimeout + time.Nanosecond)},
-		{name: "zero persisted time", status: domain.ActivationStatusAwaitingLoginCode},
-		{name: "different status", status: domain.ActivationStatusPurchased, changedAt: now.Add(-loginCodeWaitTimeout - time.Hour)},
+		{name: "over 60 seconds", sentAt: now.Add(-verificationCodeWait - time.Nanosecond), wantTimedOut: true},
+		{name: "exactly 60 seconds", sentAt: now.Add(-verificationCodeWait)},
+		{name: "under 60 seconds", sentAt: now.Add(-verificationCodeWait + time.Nanosecond)},
+		{name: "zero persisted time"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			activation := domain.Activation{Status: test.status, StatusChangedAt: test.changedAt}
-			if got := loginCodeWaitTimedOut(activation, now); got != test.wantTimedOut {
-				t.Fatalf("loginCodeWaitTimedOut() = %v, want %v", got, test.wantTimedOut)
+			if got := verificationCodeWaitTimedOut(test.sentAt, now); got != test.wantTimedOut {
+				t.Fatalf("verificationCodeWaitTimedOut() = %v, want %v", got, test.wantTimedOut)
 			}
 		})
 	}
 }
 
-func TestActivationStepFailureReasonPreservesLoginCodeTimeoutClassification(t *testing.T) {
-	activation := domain.Activation{
-		Status:        domain.ActivationStatusLoginCodeTimeout,
-		FailureReason: "等待验证码超时",
-	}
-	if reason := activationStepFailureReason(activation, errors.New("temporary provider failure")); reason != activation.FailureReason {
-		t.Fatalf("reason = %q, want %q", reason, activation.FailureReason)
+func TestActivationStepFailureReasonPreservesVerificationCodeTimeoutClassification(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status domain.ActivationStatus
+		reason string
+	}{
+		{name: "login", status: domain.ActivationStatusLoginCodeTimeout, reason: "登录验证码重发 3 次后仍未收到"},
+		{name: "pin", status: domain.ActivationStatusPINCodeTimeout, reason: "改 PIN 验证码重发 3 次后仍未收到"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			activation := domain.Activation{Status: test.status, FailureReason: test.reason}
+			if reason := activationStepFailureReason(activation, errors.New("temporary provider failure")); reason != activation.FailureReason {
+				t.Fatalf("reason = %q, want %q", reason, activation.FailureReason)
+			}
+		})
 	}
 }
 
 func TestProcessActivationRetriesCancellationAfterTimeoutClassification(t *testing.T) {
-	var cancelCalls atomic.Int32
-	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("action") != "setStatus" || r.URL.Query().Get("status") != "8" {
-			http.Error(w, "unexpected provider request", http.StatusBadRequest)
-			return
-		}
-		if cancelCalls.Add(1) == 1 {
-			http.Error(w, "temporary provider failure", http.StatusBadGateway)
-			return
-		}
-		_, _ = io.WriteString(w, "ACCESS_CANCEL")
-	}))
-	defer provider.Close()
+	for _, test := range []struct {
+		name   string
+		status domain.ActivationStatus
+		reason string
+	}{
+		{name: "login", status: domain.ActivationStatusLoginCodeTimeout, reason: "登录验证码重发 3 次后仍未收到"},
+		{name: "pin", status: domain.ActivationStatusPINCodeTimeout, reason: "改 PIN 验证码重发 3 次后仍未收到"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var cancelCalls atomic.Int32
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("action") != "setStatus" || r.URL.Query().Get("status") != "8" {
+					http.Error(w, "unexpected provider request", http.StatusBadRequest)
+					return
+				}
+				if cancelCalls.Add(1) == 1 {
+					http.Error(w, "temporary provider failure", http.StatusBadGateway)
+					return
+				}
+				_, _ = io.WriteString(w, "ACCESS_CANCEL")
+			}))
+			defer provider.Close()
 
-	activation := timedOutLoginCodeActivation()
-	store := &loginCodeTimeoutStore{currentStatus: activation.Status}
-	manager := newLoginCodeTimeoutManager(t, store, provider.URL)
-	manager.processActivation(context.Background(), activation)
+			activation := classifiedCodeTimeoutActivation(test.status, test.reason)
+			store := &loginCodeTimeoutStore{currentStatus: activation.Status}
+			manager := newLoginCodeTimeoutManager(t, store, provider.URL)
+			manager.processActivation(context.Background(), activation)
 
-	store.mu.Lock()
-	statusAfterFailure := store.currentStatus
-	finalizationsAfterFailure := len(store.finalizations)
-	store.mu.Unlock()
-	if statusAfterFailure != domain.ActivationStatusLoginCodeTimeout || finalizationsAfterFailure != 0 {
-		t.Fatalf("after failed cancellation status=%q finalizations=%d", statusAfterFailure, finalizationsAfterFailure)
-	}
+			store.mu.Lock()
+			statusAfterFailure := store.currentStatus
+			finalizationsAfterFailure := len(store.finalizations)
+			store.mu.Unlock()
+			if statusAfterFailure != test.status || finalizationsAfterFailure != 0 {
+				t.Fatalf("after failed cancellation status=%q finalizations=%d", statusAfterFailure, finalizationsAfterFailure)
+			}
 
-	activation.Status = domain.ActivationStatusLoginCodeTimeout
-	activation.StatusChangedAt = time.Now().UTC()
-	activation.LeaseOwner = "worker-2"
-	activation.LeaseVersion++
-	manager.processActivation(context.Background(), activation)
+			activation.LeaseOwner = "worker-2"
+			activation.LeaseVersion++
+			manager.processActivation(context.Background(), activation)
 
-	store.mu.Lock()
-	transitions := append([]loginCodeTimeoutTransition(nil), store.transitions...)
-	finalizations := append([][]domain.ActivationStatus(nil), store.finalizations...)
-	store.mu.Unlock()
-	if got := cancelCalls.Load(); got != 2 {
-		t.Fatalf("provider cancellation calls = %d, want 2", got)
-	}
-	if len(transitions) != 1 || transitions[0].next != domain.ActivationStatusLoginCodeTimeout {
-		t.Fatalf("timeout classification was not preserved across retry: %+v", transitions)
-	}
-	wantFinalizations := [][]domain.ActivationStatus{{domain.ActivationStatusLoginCodeTimeout}}
-	if !reflect.DeepEqual(finalizations, wantFinalizations) {
-		t.Fatalf("finalizations = %v, want %v", finalizations, wantFinalizations)
+			store.mu.Lock()
+			transitions := append([]loginCodeTimeoutTransition(nil), store.transitions...)
+			finalizations := append([][]domain.ActivationStatus(nil), store.finalizations...)
+			store.mu.Unlock()
+			if got := cancelCalls.Load(); got != 2 {
+				t.Fatalf("provider cancellation calls = %d, want 2", got)
+			}
+			if len(transitions) != 1 || transitions[0].next != test.status || transitions[0].reason != test.reason {
+				t.Fatalf("timeout classification was not preserved across retry: %+v", transitions)
+			}
+			wantFinalizations := [][]domain.ActivationStatus{{test.status}}
+			if !reflect.DeepEqual(finalizations, wantFinalizations) {
+				t.Fatalf("finalizations = %v, want %v", finalizations, wantFinalizations)
+			}
+		})
 	}
 }

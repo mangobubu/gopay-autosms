@@ -11,6 +11,7 @@ import {
   indexAccountLoginStatusesByPhone,
 } from './loginStatus'
 import { findRefreshedPrice } from './priceOptions'
+import { SMS_PROVIDERS, smsProviderProfile } from './smsProviders'
 import {
   batchStatus,
   normalizeAccountLoginStatuses,
@@ -39,7 +40,8 @@ import type {
   GoPayLoginStatusView,
   PriceOption,
   PriceTier,
-  SMSBowerSettings,
+  SMSProvider,
+  SMSProviderSettings,
 } from './types'
 
 const POLL_INTERVAL_MS = 2_000
@@ -60,13 +62,26 @@ const localStorageAccess: StorageLike | undefined = (() => {
 const persistedBatchForm = loadBatchForm()
 const persistedPriceSnapshot = persistedBatchForm.priceSnapshot
 
-const settings = reactive<SMSBowerSettings>({
-  apiKey: loadApiKey(),
-  configured: false,
+const smsProvider = ref<SMSProvider>(persistedBatchForm.smsProvider)
+const settingsByProvider = reactive<Record<SMSProvider, SMSProviderSettings>>({
+  smsbower: {
+    apiKey: loadApiKey('smsbower'),
+    configured: false,
+  },
+  'hero-sms': {
+    apiKey: loadApiKey('hero-sms'),
+    configured: false,
+  },
 })
+const settings = computed(() => settingsByProvider[smsProvider.value])
+const currentSMSProviderProfile = computed(() => smsProviderProfile(smsProvider.value))
+const supportsPriceTiers = computed(() => currentSMSProviderProfile.value.supportsPriceTiers)
+const priceFieldLabel = computed(() => (
+  smsProvider.value === 'hero-sms' ? '价格' : '价格 / 供应商'
+))
 const settingsLoading = ref(false)
 const settingsSaving = ref(false)
-const settingsReady = computed(() => Boolean(settings.configured))
+const settingsReady = computed(() => Boolean(settings.value.configured))
 
 const services = ref<CatalogOption[]>([])
 const countries = ref<CatalogOption[]>([])
@@ -98,7 +113,7 @@ const proxyPlaceholder = [
 const rules: FormRules = {
   service: [{ required: true, message: '请选择服务', trigger: 'change' }],
   country: [{ required: true, message: '请选择国家', trigger: 'change' }],
-  priceKey: [{ required: true, message: '请选择价格和供应商', trigger: 'change' }],
+  priceKey: [{ required: true, message: '请选择价格', trigger: 'change' }],
   quantity: [
     { required: true, message: '请输入计划购买数量', trigger: 'change' },
     {
@@ -142,6 +157,7 @@ let catalogActionVersion = 0
 let serviceRequestVersion = 0
 let countryRequestVersion = 0
 let priceRequestVersion = 0
+let settingsRequestVersion = 0
 let dashboardGeneration = 0
 let lastPriceSnapshot = persistedPriceSnapshot
 let lastPriceSnapshotKey = persistedBatchForm.priceKey
@@ -191,6 +207,7 @@ function currentBatchFormDraft(): ClientBatchForm {
   }
 
   const draft: ClientBatchForm = {
+    smsProvider: smsProvider.value,
     service: form.service,
     country: form.country,
     priceKey: form.priceKey,
@@ -213,6 +230,7 @@ function draftForCatalogRestore(): ClientBatchForm {
 
   const draft: ClientBatchForm = {
     ...restoringCatalogDraft,
+    smsProvider: smsProvider.value,
     quantity: form.quantity,
     pin: form.pin,
     proxy: form.proxy,
@@ -228,16 +246,24 @@ function cancelBatchFormCatalogRestore(): void {
   restoringCatalogDraft = undefined
 }
 
-function finishBatchFormCatalogRestore(restoreVersion: number, ready = true): void {
-  if (restoreVersion !== catalogRestoreVersion) return
+function finishBatchFormCatalogRestore(
+  restoreVersion: number,
+  provider: SMSProvider,
+  ready = true,
+): void {
+  if (restoreVersion !== catalogRestoreVersion || provider !== smsProvider.value) return
   restoringBatchForm = false
   restoringCatalogDraft = undefined
   catalogReady.value = ready
   persistBatchFormDraft()
 }
 
-watch(() => settings.apiKey, (apiKey) => {
-  if (apiKey.trim() || !settings.configured) saveApiKey(apiKey)
+SMS_PROVIDERS.forEach(({ value: provider }) => {
+  watch(() => settingsByProvider[provider].apiKey, (apiKey) => {
+    if (apiKey.trim() || !settingsByProvider[provider].configured) {
+      saveApiKey(apiKey, provider)
+    }
+  })
 })
 
 watch(form, () => {
@@ -328,6 +354,7 @@ async function loadPrices(options: {
 } = {}): Promise<boolean> {
   const service = form.service
   const country = form.country
+  const provider = smsProvider.value
   if (!service || !country) return false
 
   const previousSelection = options.preserveSelection ? selectedPrice.value : undefined
@@ -335,9 +362,17 @@ async function loadPrices(options: {
   const requestVersion = ++priceRequestVersion
   pricesLoading.value = true
   try {
-    const nextPrices = normalizePrices(await api.getPrices(service, country))
+    const nextPrices = normalizePrices(
+      await api.getPrices(service, country, provider),
+      {
+        includeTiers: smsProviderProfile(provider).supportsPriceTiers,
+        includeProviders: provider !== 'hero-sms',
+        currencyLabel: smsProviderProfile(provider).priceCurrencyLabel,
+      },
+    )
     if (
       requestVersion !== priceRequestVersion
+      || provider !== smsProvider.value
       || service !== form.service
       || country !== form.country
     ) return false
@@ -349,11 +384,11 @@ async function loadPrices(options: {
         form.priceKey = refreshedSelection.key
       } else {
         form.priceKey = ''
-        ElMessage.warning('原报价已失效，请重新选择价格和供应商')
+        ElMessage.warning('原报价已失效，请重新选择')
       }
     } else if (options.preserveSelection && hadSelection) {
       form.priceKey = ''
-      ElMessage.warning('原报价已失效，请重新选择价格和供应商')
+      ElMessage.warning('原报价已失效，请重新选择')
     }
 
     connectionError.value = ''
@@ -362,10 +397,14 @@ async function loadPrices(options: {
     }
     return true
   } catch (error) {
-    if (requestVersion === priceRequestVersion) ElMessage.error(friendlyError(error))
+    if (requestVersion === priceRequestVersion && provider === smsProvider.value) {
+      ElMessage.error(friendlyError(error))
+    }
     return false
   } finally {
-    if (requestVersion === priceRequestVersion) pricesLoading.value = false
+    if (requestVersion === priceRequestVersion && provider === smsProvider.value) {
+      pricesLoading.value = false
+    }
   }
 }
 
@@ -373,47 +412,62 @@ async function refreshPrices(): Promise<void> {
   const actionVersion = ++catalogActionVersion
   const service = form.service
   const country = form.country
+  const provider = smsProvider.value
   catalogReady.value = false
   const loaded = await loadPrices({ preserveSelection: true, notifySuccess: true })
   if (actionVersion === catalogActionVersion
+    && provider === smsProvider.value
     && service === form.service
     && country === form.country) catalogReady.value = loaded
 }
 
-async function loadSettings(): Promise<void> {
+async function loadSettings(provider: SMSProvider = smsProvider.value): Promise<void> {
+  const requestVersion = ++settingsRequestVersion
   settingsLoading.value = true
   try {
-    const payload = await api.getSettings()
+    const payload = await api.getSettings(provider)
+    if (requestVersion !== settingsRequestVersion || provider !== smsProvider.value || disposed) return
     const loaded = normalizeSettings(payload)
-    settings.configured = loaded.configured
+    const providerSettings = settingsByProvider[provider]
+    providerSettings.configured = loaded.configured
     // The endpoint deliberately returns a masked key. Keep the locally
     // persisted plaintext in the input instead of replacing it with the mask.
-    const clientApiKey = settings.apiKey.trim() || loadApiKey()
-    settings.apiKey = mergeClientApiKey(clientApiKey, loaded.apiKey)
+    const clientApiKey = providerSettings.apiKey.trim() || loadApiKey(provider)
+    providerSettings.apiKey = mergeClientApiKey(clientApiKey, loaded.apiKey)
+    connectionError.value = ''
   } catch (error) {
-    connectionError.value = friendlyError(error)
+    if (requestVersion === settingsRequestVersion && provider === smsProvider.value && !disposed) {
+      connectionError.value = friendlyError(error)
+    }
   } finally {
-    settingsLoading.value = false
+    if (requestVersion === settingsRequestVersion && provider === smsProvider.value) {
+      settingsLoading.value = false
+    }
   }
 }
 
 async function saveSettings(): Promise<void> {
   if (settingsSaving.value) return
-  if (!settings.apiKey.trim() && !settings.configured) {
-    ElMessage.warning('请输入 SMSBower API Key')
+  const provider = smsProvider.value
+  const profile = smsProviderProfile(provider)
+  const providerSettings = settingsByProvider[provider]
+  if (!providerSettings.apiKey.trim() && !providerSettings.configured) {
+    ElMessage.warning(`请输入 ${profile.displayName} API Key`)
     return
   }
   settingsSaving.value = true
   try {
-    const apiKey = settings.apiKey.includes('*') ? '' : settings.apiKey.trim()
+    const apiKey = providerSettings.apiKey.includes('*') ? '' : providerSettings.apiKey.trim()
     await api.saveSettings({
       apiKey,
-    })
-    if (apiKey) saveApiKey(apiKey)
+    }, provider)
+    if (provider !== smsProvider.value || disposed) return
+    if (apiKey) saveApiKey(apiKey, provider)
     connectionError.value = ''
-    ElMessage.success('SMSBower 配置已保存')
-    await loadSettings()
-    if (settings.configured) {
+    ElMessage.success(`${profile.displayName} 配置已保存`)
+    await loadSettings(provider)
+    if (provider !== smsProvider.value || disposed) return
+    if (providerSettings.configured) {
       await restoreBatchFormCatalog(draftForCatalogRestore())
     } else {
       cancelBatchFormCatalogRestore()
@@ -421,32 +475,40 @@ async function saveSettings(): Promise<void> {
       persistBatchFormDraft()
     }
   } catch (error) {
-    ElMessage.error(friendlyError(error))
+    if (provider === smsProvider.value && !disposed) ElMessage.error(friendlyError(error))
   } finally {
     settingsSaving.value = false
   }
 }
 
 async function loadServices(): Promise<ServiceCatalogLoadResult> {
+  const provider = smsProvider.value
   const requestVersion = ++serviceRequestVersion
   servicesLoading.value = true
   try {
-    const nextServices = normalizeServices(await api.getServices())
-    if (requestVersion !== serviceRequestVersion || disposed) return 'stale'
+    const nextServices = normalizeServices(await api.getServices(provider))
+    if (requestVersion !== serviceRequestVersion
+      || provider !== smsProvider.value
+      || disposed) return 'stale'
     services.value = nextServices
     connectionError.value = ''
     return 'loaded'
   } catch (error) {
-    if (requestVersion !== serviceRequestVersion || disposed) return 'stale'
+    if (requestVersion !== serviceRequestVersion
+      || provider !== smsProvider.value
+      || disposed) return 'stale'
     services.value = []
     connectionError.value = friendlyError(error)
     return 'failed'
   } finally {
-    if (requestVersion === serviceRequestVersion) servicesLoading.value = false
+    if (requestVersion === serviceRequestVersion && provider === smsProvider.value) {
+      servicesLoading.value = false
+    }
   }
 }
 
 async function loadCountriesForCurrentService(): Promise<boolean> {
+  const provider = smsProvider.value
   const requestVersion = ++countryRequestVersion
   countryQuery.value = ''
   form.country = ''
@@ -460,16 +522,22 @@ async function loadCountriesForCurrentService(): Promise<boolean> {
 
   countriesLoading.value = true
   try {
-    const nextCountries = normalizeCountries(await api.getCountries(service))
-    if (requestVersion !== countryRequestVersion || service !== form.service) return false
+    const nextCountries = normalizeCountries(await api.getCountries(service, provider))
+    if (requestVersion !== countryRequestVersion
+      || provider !== smsProvider.value
+      || service !== form.service) return false
     countries.value = nextCountries
     connectionError.value = ''
     return true
   } catch (error) {
-    if (requestVersion === countryRequestVersion) ElMessage.error(friendlyError(error))
+    if (requestVersion === countryRequestVersion && provider === smsProvider.value) {
+      ElMessage.error(friendlyError(error))
+    }
     return false
   } finally {
-    if (requestVersion === countryRequestVersion) countriesLoading.value = false
+    if (requestVersion === countryRequestVersion && provider === smsProvider.value) {
+      countriesLoading.value = false
+    }
   }
 }
 
@@ -477,8 +545,11 @@ async function handleServiceChange(): Promise<void> {
   catalogReady.value = false
   cancelBatchFormCatalogRestore()
   const actionVersion = catalogActionVersion
+  const provider = smsProvider.value
   const loaded = await loadCountriesForCurrentService()
-  if (actionVersion === catalogActionVersion) catalogReady.value = loaded
+  if (actionVersion === catalogActionVersion && provider === smsProvider.value) {
+    catalogReady.value = loaded
+  }
 }
 
 async function loadPricesForCurrentCountry(): Promise<boolean> {
@@ -491,12 +562,48 @@ async function handleCountryChange(): Promise<void> {
   catalogReady.value = false
   cancelBatchFormCatalogRestore()
   const actionVersion = catalogActionVersion
+  const provider = smsProvider.value
   const loaded = await loadPricesForCurrentCountry()
-  if (actionVersion === catalogActionVersion) catalogReady.value = loaded
+  if (actionVersion === catalogActionVersion && provider === smsProvider.value) {
+    catalogReady.value = loaded
+  }
 }
 
 function handlePriceChange(): void {
   cancelBatchFormCatalogRestore()
+}
+
+async function handleSMSProviderChange(provider: SMSProvider): Promise<void> {
+  settingsRequestVersion += 1
+  serviceRequestVersion += 1
+  countryRequestVersion += 1
+  priceRequestVersion += 1
+  cancelBatchFormCatalogRestore()
+
+  settingsLoading.value = false
+  servicesLoading.value = false
+  countriesLoading.value = false
+  pricesLoading.value = false
+  catalogReady.value = false
+  countryQuery.value = ''
+  services.value = []
+  countries.value = []
+  prices.value = []
+  lastPriceSnapshot = undefined
+  lastPriceSnapshotKey = ''
+  form.service = ''
+  form.country = ''
+  form.priceKey = ''
+  connectionError.value = ''
+
+  const draft = persistBatchFormDraft()
+  await loadSettings(provider)
+  if (disposed || provider !== smsProvider.value) return
+  if (settingsByProvider[provider].configured) {
+    await restoreBatchFormCatalog(draft)
+  } else {
+    catalogReady.value = false
+  }
 }
 
 function priceFromSnapshot(snapshot: ClientPriceSnapshot, priceKey: string): PriceOption {
@@ -513,7 +620,8 @@ function priceFromSnapshot(snapshot: ClientPriceSnapshot, priceKey: string): Pri
 }
 
 async function restoreBatchFormCatalog(draft: ClientBatchForm): Promise<void> {
-  if (!settings.configured) return
+  const provider = smsProvider.value
+  if (!settingsByProvider[provider].configured || draft.smsProvider !== provider) return
   const restoreVersion = ++catalogRestoreVersion
   catalogActionVersion += 1
   restoringBatchForm = true
@@ -530,13 +638,15 @@ async function restoreBatchFormCatalog(draft: ClientBatchForm): Promise<void> {
   form.priceKey = draft.priceKey
 
   const servicesLoaded = await loadServices()
-  if (disposed || restoreVersion !== catalogRestoreVersion) return
+  if (disposed
+    || restoreVersion !== catalogRestoreVersion
+    || provider !== smsProvider.value) return
   if (servicesLoaded === 'stale') return
   if (servicesLoaded === 'failed') {
     form.service = draft.service
     form.country = draft.country
     form.priceKey = draft.priceKey
-    finishBatchFormCatalogRestore(restoreVersion, false)
+    finishBatchFormCatalogRestore(restoreVersion, provider, false)
     return
   }
 
@@ -546,29 +656,33 @@ async function restoreBatchFormCatalog(draft: ClientBatchForm): Promise<void> {
   if (!form.service) {
     form.country = ''
     form.priceKey = ''
-    finishBatchFormCatalogRestore(restoreVersion)
+    finishBatchFormCatalogRestore(restoreVersion, provider)
     return
   }
 
   const countriesLoaded = await loadCountriesForCurrentService()
-  if (disposed || restoreVersion !== catalogRestoreVersion) return
+  if (disposed
+    || restoreVersion !== catalogRestoreVersion
+    || provider !== smsProvider.value) return
   if (!countriesLoaded) {
     form.country = country
     form.priceKey = draft.priceKey
-    finishBatchFormCatalogRestore(restoreVersion, false)
+    finishBatchFormCatalogRestore(restoreVersion, provider, false)
     return
   }
   form.country = countries.value.some((item) => item.value === country) ? country : ''
   if (!form.country) {
-    finishBatchFormCatalogRestore(restoreVersion)
+    finishBatchFormCatalogRestore(restoreVersion, provider)
     return
   }
 
   const pricesLoaded = await loadPricesForCurrentCountry()
-  if (disposed || restoreVersion !== catalogRestoreVersion) return
+  if (disposed
+    || restoreVersion !== catalogRestoreVersion
+    || provider !== smsProvider.value) return
   if (!pricesLoaded) {
     form.priceKey = draft.priceKey
-    finishBatchFormCatalogRestore(restoreVersion, false)
+    finishBatchFormCatalogRestore(restoreVersion, provider, false)
     return
   }
   const exact = prices.value.find((item) => (
@@ -584,7 +698,7 @@ async function restoreBatchFormCatalog(draft: ClientBatchForm): Promise<void> {
   form.priceKey = restoredPrice?.key ?? ''
   lastPriceSnapshot = restoredPrice ? snapshotPrice(restoredPrice) : undefined
   lastPriceSnapshotKey = form.priceKey
-  finishBatchFormCatalogRestore(restoreVersion)
+  finishBatchFormCatalogRestore(restoreVersion, provider)
 }
 
 async function startBatch(): Promise<void> {
@@ -617,19 +731,22 @@ async function startBatch(): Promise<void> {
       ElMessage.warning('价格已变化，请重新选择')
       return
     }
+    const offerProvider = smsProvider.value === 'smsbower' ? offer.provider : undefined
 
     const payload = await api.createBatch({
+      sms_provider: smsProvider.value,
       service: form.service,
       service_name: selectedService.value?.label,
       country: form.country,
       country_name: selectedCountry.value?.label,
       price: offer.price,
       max_price: offer.price === undefined ? undefined : String(offer.price),
-      provider: offer.provider,
-      provider_ids: offer.provider !== undefined
-        && Number.isFinite(Number(offer.provider))
-        && Number(offer.provider) > 0
-        ? [Number(offer.provider)]
+      currency: currentSMSProviderProfile.value.priceCurrencyCode || undefined,
+      provider: offerProvider,
+      provider_ids: offerProvider !== undefined
+        && Number.isFinite(Number(offerProvider))
+        && Number(offerProvider) > 0
+        ? [Number(offerProvider)]
         : undefined,
       quantity: form.quantity,
       pin: form.pin,
@@ -928,7 +1045,7 @@ onBeforeUnmount(() => {
         :closable="false"
       >
         <template #default>
-          请检查服务状态或 SMSBower 配置，页面会在后台继续尝试连接。
+          请检查服务状态或 {{ currentSMSProviderProfile.displayName }} 配置，页面会在后台继续尝试连接。
         </template>
       </el-alert>
 
@@ -939,7 +1056,7 @@ onBeforeUnmount(() => {
               <div>
                 <span class="step-index">01</span>
                 <div>
-                  <h2>SMSBower 配置</h2>
+                  <h2>{{ currentSMSProviderProfile.displayName }} 配置</h2>
                   <p>凭据同步保存到服务端，并在此客户端保留输入</p>
                 </div>
               </div>
@@ -949,6 +1066,21 @@ onBeforeUnmount(() => {
           </template>
 
           <el-form label-position="top" @submit.prevent="saveSettings">
+            <el-form-item label="短信平台">
+              <el-select
+                v-model="smsProvider"
+                :disabled="settingsSaving || starting"
+                placeholder="选择短信平台"
+                @change="handleSMSProviderChange"
+              >
+                <el-option
+                  v-for="provider in SMS_PROVIDERS"
+                  :key="provider.value"
+                  :label="provider.displayName"
+                  :value="provider.value"
+                />
+              </el-select>
+            </el-form-item>
             <el-form-item label="API Key">
               <el-input
                 v-model="settings.apiKey"
@@ -957,8 +1089,9 @@ onBeforeUnmount(() => {
                 clearable
                 :disabled="settingsSaving"
                 autocomplete="off"
-                placeholder="输入 SMSBower API Key"
+                :placeholder="currentSMSProviderProfile.apiKeyPlaceholder"
               />
+              <div class="field-hint">{{ currentSMSProviderProfile.apiKeyHint }}</div>
             </el-form-item>
             <el-button
               class="full-button"
@@ -1032,7 +1165,7 @@ onBeforeUnmount(() => {
                   />
                 </el-select>
               </el-form-item>
-              <el-form-item label="价格 / 供应商" prop="priceKey">
+              <el-form-item :label="priceFieldLabel" prop="priceKey">
                 <div class="price-field-content">
                   <div class="price-picker">
                     <el-select
@@ -1054,7 +1187,7 @@ onBeforeUnmount(() => {
                         <div class="price-option">
                           <span class="price-option__label">{{ priceOptionDetails(item) }}</span>
                           <span
-                            v-if="item.tier"
+                            v-if="supportsPriceTiers && item.tier"
                             class="price-tier"
                             :class="priceTierClass(item.tier)"
                             :title="priceTierTitle(item)"
@@ -1077,11 +1210,18 @@ onBeforeUnmount(() => {
                       刷新价格
                     </el-button>
                   </div>
-                  <div class="price-tier-legend" aria-label="供应商等级与价格档位说明">
+                  <div
+                    v-if="supportsPriceTiers"
+                    class="price-tier-legend"
+                    aria-label="供应商等级与价格档位说明"
+                  >
                     <span>数据源等级优先 · 缺失时显示价格档位（派生）</span>
                     <span class="price-tier price-tier--bronze">Bronze</span>
                     <span class="price-tier price-tier--silver">Silver</span>
                     <span class="price-tier price-tier--gold">Gold</span>
+                  </div>
+                  <div v-else class="field-hint">
+                    HeroSMS 价格接口未返回币种；报价数值按你的 HeroSMS 账户币种理解。
                   </div>
                 </div>
               </el-form-item>
@@ -1124,9 +1264,16 @@ onBeforeUnmount(() => {
             <div class="batch-submit-row">
               <div class="selection-summary">
                 <span>预计单价</span>
-                <strong>{{ selectedPrice?.price === undefined ? '—' : `${selectedPrice.price} ₽` }}</strong>
+                <strong>
+                  {{ selectedPrice?.price === undefined
+                    ? '—'
+                    : [
+                      selectedPrice.price,
+                      currentSMSProviderProfile.priceCurrencyLabel,
+                    ].filter((value) => value !== '').join(' ') }}
+                </strong>
                 <span
-                  v-if="selectedPrice?.tier"
+                  v-if="supportsPriceTiers && selectedPrice?.tier"
                   class="price-tier"
                   :class="priceTierClass(selectedPrice.tier)"
                   :title="priceTierTitle(selectedPrice)"

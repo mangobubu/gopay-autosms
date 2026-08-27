@@ -293,6 +293,24 @@ var migrations = []migration{
 			`ALTER TABLE activations ADD COLUMN IF NOT EXISTS status_changed_at timestamptz NOT NULL DEFAULT clock_timestamp()`,
 		},
 	},
+	{
+		version: 7,
+		statements: []string{
+			// Converge batches whose last unsuccessful activation was finalized by
+			// an older release. Their counters already prove that every planned
+			// purchase has finished without one fulfilled number.
+			`UPDATE batches SET
+				status='failed',
+				failure_reason='` + allPurchasedActivationsFailedReason + `',
+				finished_at=COALESCE(finished_at, now()),
+				updated_at=now()
+			WHERE status IN ('pending','running')
+				AND purchased_count >= quantity
+				AND purchase_reserved_count=0
+				AND fulfilled_count=0
+				AND inflight_count=0`,
+		},
+	},
 }
 
 // Migrate applies all storage migrations under one transaction-scoped advisory

@@ -1,9 +1,14 @@
 export type UnknownRecord = Record<string, unknown>
 
-export interface SMSBowerSettings {
+export type SMSProvider = 'smsbower' | 'hero-sms'
+
+export interface SMSProviderSettings {
   apiKey: string
   configured?: boolean
 }
+
+/** @deprecated Use SMSProviderSettings for provider-neutral settings flows. */
+export type SMSBowerSettings = SMSProviderSettings
 
 export interface CatalogOption {
   key: string
@@ -24,12 +29,14 @@ export interface PriceOption extends CatalogOption {
 }
 
 export interface BatchRequest {
+  sms_provider?: SMSProvider
   service: string
   service_name?: string
   country: string
   country_name?: string
   price?: number
   max_price?: string
+  currency?: string
   provider?: string
   provider_ids?: number[]
   quantity: number

@@ -1,7 +1,10 @@
-import type { PriceTier } from './types'
+import { isSMSProvider } from './smsProviders.ts'
+import type { PriceTier, SMSProvider } from './types'
 
 export const CLIENT_PERSISTENCE_VERSION = 1 as const
 export const API_KEY_STORAGE_KEY = 'gopay-autosms.client.api-key.v1'
+export const SMSBOWER_API_KEY_STORAGE_KEY = API_KEY_STORAGE_KEY
+export const HERO_SMS_API_KEY_STORAGE_KEY = 'gopay-autosms.client.hero-sms-api-key.v1'
 export const BATCH_FORM_STORAGE_KEY = 'gopay-autosms.client.batch-form.v1'
 
 const API_KEY_SCHEMA = 'gopay-autosms/api-key'
@@ -22,6 +25,7 @@ export interface ClientPriceSnapshot {
 }
 
 export interface ClientBatchForm {
+  smsProvider: SMSProvider
   service: string
   country: string
   priceKey: string
@@ -39,6 +43,7 @@ interface PersistenceEnvelope<T> {
 
 export const DEFAULT_API_KEY = ''
 export const DEFAULT_BATCH_FORM: Readonly<ClientBatchForm> = Object.freeze({
+  smsProvider: 'smsbower',
   service: '',
   country: '',
   priceKey: '',
@@ -180,7 +185,10 @@ export function normalizeBatchForm(value: unknown): ClientBatchForm {
   const defaults = { ...DEFAULT_BATCH_FORM }
   if (!isRecord(value)) return defaults
 
+  const rawSMSProvider = value.smsProvider ?? value.sms_provider
+  const smsProvider = isSMSProvider(rawSMSProvider) ? rawSMSProvider : defaults.smsProvider
   const normalized: ClientBatchForm = {
+    smsProvider,
     service: typeof value.service === 'string' ? value.service : defaults.service,
     country: typeof value.country === 'string' ? value.country : defaults.country,
     priceKey: typeof value.priceKey === 'string' ? value.priceKey : defaults.priceKey,
@@ -196,14 +204,21 @@ export function normalizeBatchForm(value: unknown): ClientBatchForm {
     proxy: typeof value.proxy === 'string' ? value.proxy : defaults.proxy,
   }
   const priceSnapshot = normalizePriceSnapshot(value.priceSnapshot)
-  if (priceSnapshot) normalized.priceSnapshot = priceSnapshot
+  if (priceSnapshot) {
+    if (smsProvider === 'hero-sms') {
+      delete priceSnapshot.provider
+      delete priceSnapshot.tier
+      delete priceSnapshot.tierDerived
+    }
+    normalized.priceSnapshot = priceSnapshot
+  }
   return normalized
 }
 
 export interface ClientPersistence {
-  loadApiKey(): string
-  saveApiKey(apiKey: string): boolean
-  clearApiKey(): boolean
+  loadApiKey(smsProvider?: SMSProvider): string
+  saveApiKey(apiKey: string, smsProvider?: SMSProvider): boolean
+  clearApiKey(smsProvider?: SMSProvider): boolean
   loadBatchForm(): ClientBatchForm
   saveBatchForm(form: ClientBatchForm): boolean
   clearBatchForm(): boolean
@@ -213,19 +228,22 @@ export interface ClientPersistence {
 export function createClientPersistence(storage?: StorageLike): ClientPersistence {
   const target = resolveStorage(storage)
   return {
-    loadApiKey: () => readEnvelope(
+    loadApiKey: (smsProvider = 'smsbower') => readEnvelope(
       target,
-      API_KEY_STORAGE_KEY,
+      apiKeyStorageKey(smsProvider),
       API_KEY_SCHEMA,
       normalizeApiKey,
     ) ?? DEFAULT_API_KEY,
-    saveApiKey: (apiKey) => writeEnvelope(
+    saveApiKey: (apiKey, smsProvider = 'smsbower') => writeEnvelope(
       target,
-      API_KEY_STORAGE_KEY,
+      apiKeyStorageKey(smsProvider),
       API_KEY_SCHEMA,
       normalizeApiKey(apiKey) ?? DEFAULT_API_KEY,
     ),
-    clearApiKey: () => safeRemoveItem(target, API_KEY_STORAGE_KEY),
+    clearApiKey: (smsProvider = 'smsbower') => safeRemoveItem(
+      target,
+      apiKeyStorageKey(smsProvider),
+    ),
     loadBatchForm: () => readEnvelope(
       target,
       BATCH_FORM_STORAGE_KEY,
@@ -242,16 +260,52 @@ export function createClientPersistence(storage?: StorageLike): ClientPersistenc
   }
 }
 
-export function loadApiKey(storage?: StorageLike): string {
-  return createClientPersistence(storage).loadApiKey()
+function apiKeyStorageKey(smsProvider: SMSProvider): string {
+  return smsProvider === 'hero-sms' ? HERO_SMS_API_KEY_STORAGE_KEY : API_KEY_STORAGE_KEY
 }
 
-export function saveApiKey(apiKey: string, storage?: StorageLike): boolean {
-  return createClientPersistence(storage).saveApiKey(apiKey)
+function providerAndStorage(
+  providerOrStorage?: SMSProvider | StorageLike,
+  storage?: StorageLike,
+): { smsProvider: SMSProvider; storage?: StorageLike } {
+  return typeof providerOrStorage === 'string'
+    ? { smsProvider: providerOrStorage, storage }
+    : { smsProvider: 'smsbower', storage: providerOrStorage }
 }
 
-export function clearApiKey(storage?: StorageLike): boolean {
-  return createClientPersistence(storage).clearApiKey()
+export function loadApiKey(storage?: StorageLike): string
+export function loadApiKey(smsProvider: SMSProvider, storage?: StorageLike): string
+export function loadApiKey(
+  providerOrStorage?: SMSProvider | StorageLike,
+  storage?: StorageLike,
+): string {
+  const resolved = providerAndStorage(providerOrStorage, storage)
+  return createClientPersistence(resolved.storage).loadApiKey(resolved.smsProvider)
+}
+
+export function saveApiKey(apiKey: string, storage?: StorageLike): boolean
+export function saveApiKey(
+  apiKey: string,
+  smsProvider: SMSProvider,
+  storage?: StorageLike,
+): boolean
+export function saveApiKey(
+  apiKey: string,
+  providerOrStorage?: SMSProvider | StorageLike,
+  storage?: StorageLike,
+): boolean {
+  const resolved = providerAndStorage(providerOrStorage, storage)
+  return createClientPersistence(resolved.storage).saveApiKey(apiKey, resolved.smsProvider)
+}
+
+export function clearApiKey(storage?: StorageLike): boolean
+export function clearApiKey(smsProvider: SMSProvider, storage?: StorageLike): boolean
+export function clearApiKey(
+  providerOrStorage?: SMSProvider | StorageLike,
+  storage?: StorageLike,
+): boolean {
+  const resolved = providerAndStorage(providerOrStorage, storage)
+  return createClientPersistence(resolved.storage).clearApiKey(resolved.smsProvider)
 }
 
 export function loadBatchForm(storage?: StorageLike): ClientBatchForm {

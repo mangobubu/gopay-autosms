@@ -16,9 +16,10 @@ const maxResponseBytes = 4 << 20
 
 // Client calls the SMSBower handler endpoint.
 type Client struct {
-	apiKey   string
-	endpoint string
-	http     HTTPDoer
+	apiKey       string
+	endpoint     string
+	http         HTTPDoer
+	priceActions []string
 }
 
 var _ API = (*Client)(nil)
@@ -35,10 +36,20 @@ func NewClient(cfg Config) (*Client, error) {
 	if doer == nil {
 		doer = &http.Client{Timeout: 30 * time.Second}
 	}
+	priceActions := make([]string, 0, len(cfg.PriceActions))
+	for _, action := range cfg.PriceActions {
+		if action = strings.TrimSpace(action); action != "" {
+			priceActions = append(priceActions, action)
+		}
+	}
+	if len(priceActions) == 0 {
+		priceActions = []string{"getPricesV3", "getPricesV2", "getPrices"}
+	}
 	return &Client{
-		apiKey:   strings.TrimSpace(cfg.APIKey),
-		endpoint: endpoint,
-		http:     doer,
+		apiKey:       strings.TrimSpace(cfg.APIKey),
+		endpoint:     endpoint,
+		http:         doer,
+		priceActions: priceActions,
 	}, nil
 }
 
@@ -81,9 +92,8 @@ func (c *Client) GetCountries(ctx context.Context) ([]Country, error) {
 // GetPrices prefers V3 and falls back through V2 to the legacy catalogue.
 func (c *Client) GetPrices(ctx context.Context, req PriceRequest) ([]Price, error) {
 	params := priceParams(req)
-	actions := [...]string{"getPricesV3", "getPricesV2", "getPrices"}
-	errs := make([]error, 0, len(actions))
-	for _, action := range actions {
+	errs := make([]error, 0, len(c.priceActions))
+	for _, action := range c.priceActions {
 		body, err := c.call(ctx, action, params)
 		if err == nil {
 			var prices []Price

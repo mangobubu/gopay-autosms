@@ -18,7 +18,7 @@ test('shows cancelled instead of an expiration time for a cancelled activation',
 })
 
 test('shows cancelled after a classified provider cancellation is finalized', () => {
-  for (const status of ['duplicate', 'login_code_timeout', 'pin_required', 'unregistered']) {
+  for (const status of ['duplicate', 'login_code_timeout', 'pin_code_timeout', 'pin_required', 'unregistered']) {
     assert.deepEqual(
       activationExpiryPresentation(
         status,
@@ -32,14 +32,40 @@ test('shows cancelled after a classified provider cancellation is finalized', ()
 })
 
 test('keeps the expiration time while provider cancellation is still pending', () => {
+  for (const status of ['login_code_timeout', 'pin_code_timeout']) {
+    const presentation = activationExpiryPresentation(
+      status,
+      '2026-08-26T10:01:00.000Z',
+      undefined,
+      now,
+    )
+
+    assert.notEqual(presentation.label, '已取消')
+    assert.equal(presentation.countdown, '01分00秒')
+  }
+})
+
+test('shows settled after a blocked PIN submission is finalized', () => {
+  assert.deepEqual(
+    activationExpiryPresentation(
+      'pin_submission_blocked',
+      '2026-08-26T10:01:00.000Z',
+      '2026-08-26T10:00:30.000Z',
+      now,
+    ),
+    { label: '已结算' },
+  )
+})
+
+test('keeps the expiration time while blocked PIN settlement is still pending', () => {
   const presentation = activationExpiryPresentation(
-    'duplicate',
+    'pin_submission_blocked',
     '2026-08-26T10:01:00.000Z',
     undefined,
     now,
   )
 
-  assert.notEqual(presentation.label, '已取消')
+  assert.notEqual(presentation.label, '已结算')
   assert.equal(presentation.countdown, '01分00秒')
 })
 

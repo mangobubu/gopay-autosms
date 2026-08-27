@@ -1,11 +1,16 @@
 package gopay
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
 type LoginStage string
 
 const (
 	LoginStageIdle           LoginStage = "idle"
+	LoginStageReady1FA       LoginStage = "ready_login_1fa_cycle"
+	LoginStageCycleReady1FA  LoginStage = "login_1fa_cycle_ready"
 	LoginStageAwaiting1FAOTP LoginStage = "awaiting_login_1fa_otp"
 	LoginStageReady2FA       LoginStage = "ready_login_2fa_cycle"
 	LoginStageCycleReady2FA  LoginStage = "login_2fa_cycle_ready"
@@ -36,6 +41,14 @@ const (
 	PINStageComplete        PINStage = "pin_complete"
 )
 
+type VerificationCycleRequestState string
+
+const (
+	VerificationCycleRequestNone        VerificationCycleRequestState = ""
+	VerificationCycleRequestDispatching VerificationCycleRequestState = "dispatching"
+	VerificationCycleRequestAccepted    VerificationCycleRequestState = "accepted"
+)
+
 // Session contains all protocol state needed to resume a multi-request login
 // or PIN setup. It can be persisted directly as JSON.
 type Session struct {
@@ -45,6 +58,10 @@ type Session struct {
 	ProxyURL    string         `json:"proxy_url,omitempty"`
 	DeviceToken string         `json:"device_token,omitempty"`
 	SMSCycle    int            `json:"sms_cycle"`
+	// VerificationCycleRequest records the provider setStatus=3 intent before
+	// the external call and its acknowledgement before the local SMS cycle is
+	// advanced. This distinguishes a first BAD_STATUS from crash recovery.
+	VerificationCycleRequest VerificationCycleRequestState `json:"verification_cycle_request,omitempty"`
 
 	TransactionID     string     `json:"transaction_id"`
 	VerificationID    string     `json:"verification_id"`
@@ -60,14 +77,23 @@ type Session struct {
 	TwoFAMethods      []string   `json:"two_fa_methods,omitempty"`
 	Methods           []string   `json:"methods,omitempty"`
 	LoginStage        LoginStage `json:"login_stage"`
+	LoginCodeSentAt   time.Time  `json:"login_code_sent_at,omitempty"`
+	LoginCodeResends  int        `json:"login_code_resends,omitempty"`
+	// DispatchUncertain is persisted before a non-idempotent OTP initiate call
+	// and cleared only after the returned token has been durably saved. A true
+	// value means a delivered code must not be verified with the older token.
+	LoginCodeDispatchUncertain bool `json:"login_code_dispatch_uncertain,omitempty"`
 
-	PINVerificationID    string   `json:"pin_verification_id"`
-	PINOTPToken          string   `json:"pin_otp_token"`
-	PINVerificationToken string   `json:"pin_verification_token"`
-	PINChallengeID       string   `json:"pin_challenge_id,omitempty"`
-	PINClientID          string   `json:"pin_client_id,omitempty"`
-	PINToken             string   `json:"pin_token,omitempty"`
-	PINStage             PINStage `json:"pin_stage,omitempty"`
+	PINVerificationID        string    `json:"pin_verification_id"`
+	PINOTPToken              string    `json:"pin_otp_token"`
+	PINVerificationToken     string    `json:"pin_verification_token"`
+	PINChallengeID           string    `json:"pin_challenge_id,omitempty"`
+	PINClientID              string    `json:"pin_client_id,omitempty"`
+	PINToken                 string    `json:"pin_token,omitempty"`
+	PINStage                 PINStage  `json:"pin_stage,omitempty"`
+	PINCodeSentAt            time.Time `json:"pin_code_sent_at,omitempty"`
+	PINCodeResends           int       `json:"pin_code_resends,omitempty"`
+	PINCodeDispatchUncertain bool      `json:"pin_code_dispatch_uncertain,omitempty"`
 }
 
 type PINStatus struct {

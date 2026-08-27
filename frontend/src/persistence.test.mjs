@@ -6,6 +6,7 @@ import {
   BATCH_FORM_STORAGE_KEY,
   CLIENT_PERSISTENCE_VERSION,
   DEFAULT_BATCH_FORM,
+  HERO_SMS_API_KEY_STORAGE_KEY,
   createClientPersistence,
   loadApiKey,
   loadBatchForm,
@@ -33,6 +34,7 @@ class MemoryStorage {
 test('direct helpers persist the API key and complete batch draft in versioned envelopes', () => {
   const storage = new MemoryStorage()
   const form = {
+    smsProvider: 'smsbower',
     service: 'goPay',
     country: 'ID',
     priceKey: 'offer-7',
@@ -61,6 +63,18 @@ test('direct helpers persist the API key and complete batch draft in versioned e
   assert.deepEqual(JSON.parse(storage.getItem(BATCH_FORM_STORAGE_KEY)).version, 1)
 })
 
+test('stores SMSBower and HeroSMS API keys independently while keeping the legacy key', () => {
+  const storage = new MemoryStorage()
+
+  assert.equal(saveApiKey(' smsbower-key ', storage), true)
+  assert.equal(saveApiKey(' hero-key ', 'hero-sms', storage), true)
+  assert.equal(loadApiKey(storage), 'smsbower-key')
+  assert.equal(loadApiKey('smsbower', storage), 'smsbower-key')
+  assert.equal(loadApiKey('hero-sms', storage), 'hero-key')
+  assert.equal(JSON.parse(storage.getItem(API_KEY_STORAGE_KEY)).data, 'smsbower-key')
+  assert.equal(JSON.parse(storage.getItem(HERO_SMS_API_KEY_STORAGE_KEY)).data, 'hero-key')
+})
+
 test('keeps client plaintext when the settings endpoint returns a masked key', () => {
   assert.equal(mergeClientApiKey(' client-secret ', 'clie*****cret'), 'client-secret')
   assert.equal(mergeClientApiKey('client-secret', ''), 'client-secret')
@@ -79,6 +93,7 @@ test('returns fresh defaults for malformed, incompatible and unavailable storage
 
   assert.equal(persistence.loadApiKey(), '')
   assert.deepEqual(persistence.loadBatchForm(), {
+    smsProvider: 'smsbower',
     service: '',
     country: '',
     priceKey: '',
@@ -115,6 +130,7 @@ test('sanitizes invalid individual form fields without losing valid fields', () 
   }))
 
   assert.deepEqual(createClientPersistence(storage).loadBatchForm(), {
+    smsProvider: 'smsbower',
     service: 'gopay',
     country: '',
     priceKey: 'offer',
@@ -155,11 +171,58 @@ test('returns fresh defaults so restored form state cannot leak between callers'
   assert.deepEqual(second, DEFAULT_BATCH_FORM)
 })
 
+test('restores legacy drafts as SMSBower and keeps an explicit HeroSMS provider', () => {
+  const storage = new MemoryStorage()
+  storage.setItem(BATCH_FORM_STORAGE_KEY, JSON.stringify({
+    schema: 'gopay-autosms/batch-form',
+    version: CLIENT_PERSISTENCE_VERSION,
+    data: {
+      service: 'legacy-service',
+      country: '6',
+      priceKey: 'legacy-price',
+      quantity: 2,
+      pin: '123456',
+      proxy: '',
+    },
+  }))
+
+  assert.equal(loadBatchForm(storage).smsProvider, 'smsbower')
+
+  saveBatchForm({
+    smsProvider: 'hero-sms',
+    service: 'hero-service',
+    country: 'ID',
+    priceKey: 'hero-price',
+    quantity: 3,
+    pin: '654321',
+    proxy: '',
+    priceSnapshot: {
+      value: 'hero-price',
+      price: 1,
+      provider: '17',
+      tier: 'Gold',
+      tierDerived: false,
+    },
+  }, storage)
+
+  assert.deepEqual(loadBatchForm(storage), {
+    smsProvider: 'hero-sms',
+    service: 'hero-service',
+    country: 'ID',
+    priceKey: 'hero-price',
+    quantity: 3,
+    pin: '654321',
+    proxy: '',
+    priceSnapshot: { value: 'hero-price', price: 1 },
+  })
+})
+
 test('clear methods remove both client-persisted values', () => {
   const storage = new MemoryStorage()
   const persistence = createClientPersistence(storage)
   persistence.saveApiKey('secret')
   persistence.saveBatchForm({
+    smsProvider: 'smsbower',
     service: 'wa', country: '62', priceKey: 'offer', quantity: 2, pin: '123456', proxy: '',
   })
 

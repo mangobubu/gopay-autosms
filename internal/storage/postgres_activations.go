@@ -42,9 +42,26 @@ const recordBatchPurchaseSQL = `UPDATE batches SET
 		AND purchase_reserved_count > 0
 		AND purchased_count < quantity`
 
+// This predicate is evaluated against the counters before the current slot is
+// released. An inflight count of one therefore means the current unsuccessful
+// activation is the last purchased number still being processed.
+const allPurchasedActivationsFailedReason = "计划购买数量内的号码均处理失败，任务已自动停止"
+
+const allPurchasedActivationsFailedSQL = `NOT $2::boolean
+	AND status IN ('pending','running')
+	AND purchased_count >= quantity
+	AND purchase_reserved_count=0
+	AND fulfilled_count=0
+	AND inflight_count=1`
+
 const releaseBatchSlotSQL = `UPDATE batches SET
 	fulfilled_count=fulfilled_count+CASE WHEN $2::boolean THEN 1 ELSE 0 END,
 	inflight_count=GREATEST(inflight_count-1, 0),
+	status=CASE WHEN ` + allPurchasedActivationsFailedSQL + ` THEN 'failed' ELSE status END,
+	failure_reason=CASE WHEN ` + allPurchasedActivationsFailedSQL + `
+		THEN '` + allPurchasedActivationsFailedReason + `' ELSE failure_reason END,
+	finished_at=CASE WHEN ` + allPurchasedActivationsFailedSQL + `
+		THEN COALESCE(finished_at, now()) ELSE finished_at END,
 	updated_at=now()
 	WHERE id=$1 AND (NOT $2::boolean OR fulfilled_count < quantity)`
 

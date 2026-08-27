@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"unicode/utf8"
 
@@ -20,15 +21,41 @@ type upstreamLoginFailure struct {
 }
 
 func activationStepFailureReason(activation domain.Activation, err error) string {
-	// Classified cancellations are finalized with the SMS provider on a later
-	// worker pass. A transient cancellation error must not replace the durable
+	// Classified provider actions are finalized on a later worker pass. A
+	// transient cancellation or completion error must not replace the durable
 	// classification already shown on the activation.
 	if (activation.Status == domain.ActivationStatusLoginFailed ||
-		activation.Status == domain.ActivationStatusLoginCodeTimeout) &&
+		activation.Status == domain.ActivationStatusPINSubmissionBlocked ||
+		activation.Status == domain.ActivationStatusLoginCodeTimeout ||
+		activation.Status == domain.ActivationStatusPINCodeTimeout) &&
 		strings.TrimSpace(activation.FailureReason) != "" {
 		return boundActivationFailureReason(activation.FailureReason)
 	}
 	return boundActivationFailureReason(err.Error())
+}
+
+func pinSubmissionBlockedFailure(status domain.ActivationStatus, err error) bool {
+	if status != domain.ActivationStatusSettingPIN {
+		return false
+	}
+	var httpErr *gopay.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusForbidden {
+		return false
+	}
+	var payload struct {
+		Errors []struct {
+			Code string `json:"code"`
+		} `json:"errors"`
+	}
+	if json.Unmarshal(httpErr.Body, &payload) != nil {
+		return false
+	}
+	for _, item := range payload.Errors {
+		if item.Code == "GoPay-112" {
+			return true
+		}
+	}
+	return false
 }
 
 func loginFailureReason(status domain.ActivationStatus, err error) string {

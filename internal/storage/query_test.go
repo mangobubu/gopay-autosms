@@ -117,6 +117,34 @@ func TestStatusChangedAtMigrationAndTransitionPreserveStateEntryTime(t *testing.
 	}
 }
 
+func TestAllFailedBatchMigrationConvergesExistingActiveBatches(t *testing.T) {
+	var migrationSQL strings.Builder
+	for _, migration := range migrations {
+		if migration.version != 7 {
+			continue
+		}
+		for _, statement := range migration.statements {
+			migrationSQL.WriteString(statement)
+			migrationSQL.WriteByte('\n')
+		}
+	}
+	sql := migrationSQL.String()
+	for _, required := range []string{
+		"status='failed'",
+		"failure_reason='" + allPurchasedActivationsFailedReason + "'",
+		"finished_at=COALESCE(finished_at, now())",
+		"status IN ('pending','running')",
+		"purchased_count >= quantity",
+		"purchase_reserved_count=0",
+		"fulfilled_count=0",
+		"inflight_count=0",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("all-failed batch migration missing %q: %s", required, sql)
+		}
+	}
+}
+
 func TestPurchaseCountMigrationBackfillsAndConvergesRunningBatches(t *testing.T) {
 	var migrationSQL strings.Builder
 	for _, migration := range migrations {
@@ -264,7 +292,7 @@ func TestFreezeConflictSQLDoesNotClaimExistingProviderIdentity(t *testing.T) {
 	}
 }
 
-func TestPurchaseAccountingSQLKeepsBatchRunningUntilExplicitStop(t *testing.T) {
+func TestPurchaseAccountingSQLStopsWhenEveryPlannedNumberFails(t *testing.T) {
 	if !strings.Contains(recordBatchPurchaseSQL, "status=CASE WHEN status IN ('pending','running') THEN 'running' ELSE status END") {
 		t.Fatalf("recording the last purchase must keep the batch running: %s", recordBatchPurchaseSQL)
 	}
@@ -279,14 +307,37 @@ func TestPurchaseAccountingSQLKeepsBatchRunningUntilExplicitStop(t *testing.T) {
 			t.Fatalf("slot release SQL missing %q: %s", required, releaseBatchSlotSQL)
 		}
 	}
-	if strings.Contains(releaseBatchSlotSQL, "'completed'") || strings.Contains(releaseBatchSlotSQL, "finished_at") {
-		t.Fatalf("slot release must not complete a batch before explicit stop: %s", releaseBatchSlotSQL)
+	for _, required := range []string{
+		"NOT $2::boolean",
+		"status IN ('pending','running')",
+		"purchased_count >= quantity",
+		"purchase_reserved_count=0",
+		"fulfilled_count=0",
+		"inflight_count=1",
+	} {
+		if !strings.Contains(allPurchasedActivationsFailedSQL, required) {
+			t.Fatalf("all-failed predicate missing %q: %s", required, allPurchasedActivationsFailedSQL)
+		}
+	}
+	for _, required := range []string{
+		"THEN 'failed' ELSE status END",
+		allPurchasedActivationsFailedReason,
+		"THEN COALESCE(finished_at, now()) ELSE finished_at END",
+	} {
+		if !strings.Contains(releaseBatchSlotSQL, required) {
+			t.Fatalf("all-failed batch stop SQL missing %q: %s", required, releaseBatchSlotSQL)
+		}
+	}
+	if strings.Contains(releaseBatchSlotSQL, "'completed'") {
+		t.Fatalf("an all-failed batch must be failed rather than completed: %s", releaseBatchSlotSQL)
 	}
 }
 
 func TestCancelBatchActivationsSQLInvalidatesLeaseAndQueuesDelete(t *testing.T) {
 	for _, required := range []string{
-		"control_action='delete'",
+		"status IN ('pin_submission_blocked','login_code_timeout','pin_code_timeout') THEN control_action",
+		"status IN ('pin_submission_blocked','login_code_timeout','pin_code_timeout')",
+		"AND control_action='' THEN hidden_at",
 		"lease_owner=''",
 		"lease_until=NULL",
 		"lease_version=lease_version+1",
@@ -296,6 +347,9 @@ func TestCancelBatchActivationsSQLInvalidatesLeaseAndQueuesDelete(t *testing.T) 
 		if !strings.Contains(cancelBatchActivationsSQL, required) {
 			t.Fatalf("batch cancellation SQL missing %q: %s", required, cancelBatchActivationsSQL)
 		}
+	}
+	if strings.Contains(cancelBatchActivationsSQL, "control_action='delete',") {
+		t.Fatalf("batch cancellation must not overwrite durable classified provider intent: %s", cancelBatchActivationsSQL)
 	}
 }
 

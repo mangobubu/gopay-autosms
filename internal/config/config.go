@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	DefaultDatabaseURL = "postgres://autosms:autosms_local_password@127.0.0.1:5432/autosms?sslmode=disable"
-	DefaultSMSBaseURL  = "https://smsbower.page/stubs/handler_api.php"
+	DefaultDatabaseURL    = "postgres://autosms:autosms_local_password@127.0.0.1:5432/autosms?sslmode=disable"
+	DefaultSMSBaseURL     = "https://smsbower.page/stubs/handler_api.php"
+	DefaultHeroSMSBaseURL = "https://hero-sms.com/stubs/handler_api.php"
 )
 
 type Config struct {
@@ -21,6 +22,7 @@ type Config struct {
 	SecretKey         string
 	DataDir           string
 	SMSBaseURL        string
+	HeroSMSBaseURL    string
 	GoPaySSOBaseURL   string
 	GoPayBaseURL      string
 	PollInterval      time.Duration
@@ -37,6 +39,7 @@ func Load() Config {
 		SecretKey:         envString("AUTOSMS_SECRET_KEY", ""),
 		DataDir:           envString("AUTOSMS_DATA_DIR", "data"),
 		SMSBaseURL:        envString("AUTOSMS_SMSBOWER_BASE_URL", DefaultSMSBaseURL),
+		HeroSMSBaseURL:    envString("AUTOSMS_HEROSMS_BASE_URL", envString("AUTOSMS_HERO_SMS_BASE_URL", DefaultHeroSMSBaseURL)),
 		GoPaySSOBaseURL:   envString("AUTOSMS_GOPAY_SSO_BASE_URL", "https://accounts.goto-products.com"),
 		GoPayBaseURL:      envString("AUTOSMS_GOPAY_BASE_URL", "https://customer.gopayapi.com"),
 		PollInterval:      envDuration("AUTOSMS_POLL_INTERVAL", 2*time.Second),

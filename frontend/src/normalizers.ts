@@ -6,7 +6,7 @@ import type {
   GoPayLoginStatusView,
   PriceOption,
   PriceTier,
-  SMSBowerSettings,
+  SMSProviderSettings,
   StatusMeta,
   UnknownRecord,
   VerificationCodeView,
@@ -106,8 +106,13 @@ function hasPriceTierMetadata(record: UnknownRecord): boolean {
   })
 }
 
-function priceOptionLabel(item: PriceOption): string {
-  const parts = [item.price === undefined ? '价格待定' : `${formatNumber(item.price)} ₽`]
+function priceOptionLabel(item: PriceOption, currencyLabel = '₽'): string {
+  const unit = currencyLabel.trim()
+  const parts = [
+    item.price === undefined
+      ? '价格待定'
+      : [formatNumber(item.price), unit].filter(Boolean).join(' '),
+  ]
   if (item.tier) parts.push(item.tier)
   if (item.provider) parts.push(item.provider)
   if (item.stock !== undefined) parts.push(`库存 ${formatNumber(item.stock)}`)
@@ -126,7 +131,7 @@ function derivedPriceTier(index: number, count: number): PriceTier {
   return tiers[Math.min(2, Math.floor((index * tiers.length) / count))]
 }
 
-function deriveMissingPriceTiers(items: PriceOption[]): PriceOption[] {
+function deriveMissingPriceTiers(items: PriceOption[], currencyLabel: string): PriceOption[] {
   const distinctPrices = Array.from(new Set(
     items
       .filter(isAvailablePrice)
@@ -148,7 +153,7 @@ function deriveMissingPriceTiers(items: PriceOption[]): PriceOption[] {
     } satisfies PriceOption
     return {
       ...normalized,
-      label: priceOptionLabel(normalized),
+      label: priceOptionLabel(normalized, currencyLabel),
     }
   })
 }
@@ -249,21 +254,35 @@ export function normalizeCountries(payload: unknown): CatalogOption[] {
   )
 }
 
-export function normalizePrices(payload: unknown): PriceOption[] {
+export interface NormalizePricesOptions {
+  includeTiers?: boolean
+  includeProviders?: boolean
+  currencyLabel?: string
+}
+
+export function normalizePrices(
+  payload: unknown,
+  options: NormalizePricesOptions = {},
+): PriceOption[] {
+  const includeTiers = options.includeTiers !== false
+  const includeProviders = options.includeProviders !== false
+  const currencyLabel = options.currencyLabel ?? '₽'
   const normalized = entries(payload, ['prices', 'items', 'providers', 'offers'])
     .map(([entryKey, value], index) => {
       const raw = optionRecord(entryKey, value)
-      const provider = asText(
-        pick(raw, ['provider', 'provider_id', 'providerId', 'operator', 'vendor', 'supplier', 'name']),
-      )
+      const provider = includeProviders
+        ? asText(pick(raw, [
+          'provider', 'provider_id', 'providerId', 'operator', 'vendor', 'supplier', 'name',
+        ]))
+        : undefined
       const rawPrice = pick(raw, ['price', 'cost', 'amount', 'rate', 'value'])
       const price = asOptionalNumber(rawPrice)
       const rawStock = pick(raw, ['stock', 'count', 'available', 'quantity'])
       const stock = asOptionalNumber(rawStock)
-      const tier = priceTierFromRecord(raw)
+      const tier = includeTiers ? priceTierFromRecord(raw) : undefined
       const id = asText(
         pick(raw, ['id', 'code', 'key', 'provider_id', 'providerId']),
-        `${provider}:${price ?? entryKey}`,
+        `${provider ?? ''}:${price ?? entryKey}`,
       )
       return {
         key: `${id}-${index}`,
@@ -293,10 +312,19 @@ export function normalizePrices(payload: unknown): PriceOption[] {
     })
     .map(({ item }) => item)
 
-  return deriveMissingPriceTiers(sorted)
+  if (includeTiers) return deriveMissingPriceTiers(sorted, currencyLabel)
+  return sorted.map((item) => ({
+    ...item,
+    tier: undefined,
+    tierDerived: undefined,
+    label: priceOptionLabel(
+      { ...item, tier: undefined, tierDerived: undefined },
+      currencyLabel,
+    ),
+  }))
 }
 
-export function normalizeSettings(payload: unknown): SMSBowerSettings {
+export function normalizeSettings(payload: unknown): SMSProviderSettings {
   const value = unwrap(payload)
   const record = isRecord(value) && isRecord(value.settings) ? value.settings : value
   if (!isRecord(record)) return { apiKey: '', configured: false }
@@ -438,10 +466,20 @@ export function normalizeActivation(payload: unknown): ActivationView {
   }
 }
 
+const pinnedActivationStatuses = new Set([
+  'awaiting_subsequent_code',
+  'polling',
+  'active',
+])
+
 export function normalizeActivations(payload: unknown): ActivationView[] {
-  return entries(payload, ['activations', 'items', 'records'])
+  const activations = entries(payload, ['activations', 'items', 'records'])
     .map(([, value]) => normalizeActivation(value))
     .filter((item) => item.id)
+
+  const awaitingSubsequent = activations.filter((item) => pinnedActivationStatuses.has(item.status))
+  const remaining = activations.filter((item) => !pinnedActivationStatuses.has(item.status))
+  return [...awaitingSubsequent, ...remaining]
 }
 
 function normalizeLoginState(value: unknown, valid?: boolean): GoPayLoginState {
@@ -517,7 +555,7 @@ const statusMap: Record<string, StatusMeta> = {
   duplicate: { label: '重复号码', type: 'warning', active: false },
   checking_login: { label: '校验号码', type: 'primary', active: true },
   awaiting_login_code: { label: '等待登录验证码', type: 'warning', active: true },
-  login_code_timeout: { label: '等待验证码超时', type: 'danger', active: false },
+  login_code_timeout: { label: '登录验证码失败', type: 'danger', active: false },
   logging_in: { label: '正在登录', type: 'primary', active: true },
   waiting_login_otp: { label: '等待登录验证码', type: 'warning', active: true },
   pin_required: { label: '需要 PIN，已丢弃', type: 'danger', active: false },
@@ -529,7 +567,9 @@ const statusMap: Record<string, StatusMeta> = {
   preparing_pin: { label: '准备设置 PIN', type: 'primary', active: true },
   waiting_pin_otp: { label: '等待改 PIN 验证码', type: 'warning', active: true },
   awaiting_pin_code: { label: '等待改 PIN 验证码', type: 'warning', active: true },
+  pin_code_timeout: { label: '改 PIN 验证码失败', type: 'danger', active: false },
   setting_pin: { label: '正在设置 PIN', type: 'primary', active: true },
+  pin_submission_blocked: { label: '新 PIN 提交受限', type: 'danger', active: false },
   pin_changed: { label: '改 PIN 成功', type: 'success', active: true },
   awaiting_subsequent_code: { label: '等待后续验证码', type: 'success', active: true },
   polling: { label: '等待后续验证码', type: 'success', active: true },
