@@ -60,6 +60,14 @@ test('shows each durable PIN workflow status without inferring from historical c
   assert.equal(activationStatus('awaiting_subsequent_code').label, '等待后续验证码')
 })
 
+test('maps a login code timeout to a terminal danger status', () => {
+  assert.deepEqual(activationStatus('login_code_timeout'), {
+    label: '等待验证码超时',
+    type: 'danger',
+    active: false,
+  })
+})
+
 test('keeps activation errors available while PIN setup is being processed', () => {
   const activation = normalizeActivation({
     id: 'activation-1',

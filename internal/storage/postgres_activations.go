@@ -14,12 +14,22 @@ import (
 
 const activationColumns = `id, batch_id, account_id, provider, provider_activation_id,
 	phone_number, phone_fingerprint, service_code, country_code, operator,
-	purchase_price_amount, currency, status, failure_reason, balance_rp,
+	purchase_price_amount, currency, status, status_changed_at, failure_reason, balance_rp,
 	balance_checked_at, ever_fulfilled, slot_reserved, sms_cycle, next_run_at, lease_owner,
 	lease_until, lease_version, control_action, provider_payload, provider_expires_at,
 	last_polled_at, hidden_at, created_at, updated_at, finished_at`
 
 const providerActivationLockSQL = `SELECT pg_advisory_xact_lock(hashtextextended($1, 1))`
+
+const transitionStatusChangedAtSQL = `status_changed_at=CASE
+	WHEN status IS DISTINCT FROM $2 THEN clock_timestamp()
+	ELSE status_changed_at
+END`
+
+const duplicateStatusChangedAtSQL = `status_changed_at=CASE
+	WHEN status IS DISTINCT FROM 'duplicate' THEN clock_timestamp()
+	ELSE status_changed_at
+END`
 
 const recordBatchPurchaseSQL = `UPDATE batches SET
 	purchase_reserved_count=purchase_reserved_count-1,
@@ -61,7 +71,7 @@ func scanActivation(row rowScanner) (domain.Activation, error) {
 		&activation.ID, &activation.BatchID, &accountID, &activation.Provider,
 		&activation.ProviderActivationID, &activation.PhoneNumber, &activation.PhoneFingerprint,
 		&activation.ServiceCode, &activation.CountryCode, &activation.Operator,
-		&activation.PurchasePriceAmount, &activation.Currency, &status,
+		&activation.PurchasePriceAmount, &activation.Currency, &status, &activation.StatusChangedAt,
 		&activation.FailureReason, &balance, &balanceCheckedAt, &activation.EverFulfilled,
 		&activation.SlotReserved, &activation.SMSCycle, &activation.NextRunAt, &activation.LeaseOwner, &leaseUntil,
 		&activation.LeaseVersion,
@@ -244,7 +254,9 @@ func (s *PostgresStore) CreateActivationAtomically(
 			return CreateActivationResult{}, mapError(err)
 		}
 		activation, err = scanActivation(tx.QueryRow(ctx, `UPDATE activations SET
-			status='duplicate', failure_reason='historical phone number', next_run_at=now(), updated_at=now()
+			status='duplicate',
+			`+duplicateStatusChangedAtSQL+`,
+			failure_reason='historical phone number', next_run_at=now(), updated_at=now()
 			WHERE id=$1 RETURNING `+activationColumns, activation.ID))
 		if err != nil {
 			return CreateActivationResult{}, mapError(err)
@@ -537,7 +549,9 @@ func (s *PostgresStore) transitionActivation(
 		}
 	}
 	terminal := next.Terminal()
-	query := `UPDATE activations SET status=$2, failure_reason=$3,
+	query := `UPDATE activations SET status=$2,
+		` + transitionStatusChangedAtSQL + `,
+		failure_reason=$3,
 		finished_at=CASE WHEN $4 THEN COALESCE(finished_at, now()) ELSE NULL END,
 		slot_reserved=CASE WHEN $4 THEN false ELSE slot_reserved END,
 		lease_owner=CASE WHEN $4 THEN '' ELSE lease_owner END,

@@ -30,7 +30,7 @@ func (s ActivationStatus) Valid() bool {
 	switch s {
 	case ActivationStatusPurchased, ActivationStatusDuplicate, ActivationStatusAwaitingLoginCode,
 		ActivationStatusLoggingIn, ActivationStatusPINRequired, ActivationStatusUnregistered,
-		ActivationStatusLoginFailed,
+		ActivationStatusLoginFailed, ActivationStatusLoginCodeTimeout,
 		ActivationStatusCheckingBalance, ActivationStatusZeroBalanceUsed, ActivationStatusSettingPIN,
 		ActivationStatusAwaitingPINCode, ActivationStatusPINChanged, ActivationStatusAwaitingSubsequentCode,
 		ActivationStatusActive, ActivationStatusSuccess,

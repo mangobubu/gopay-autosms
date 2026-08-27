@@ -70,17 +70,42 @@ func (e *HTTPError) Error() string {
 	if len(e.Body) == 0 {
 		return fmt.Sprintf("gopay: HTTP %d", e.StatusCode)
 	}
-	return fmt.Sprintf("gopay: HTTP %d: %s", e.StatusCode, redactBody(string(e.Body)))
+	return fmt.Sprintf("gopay: HTTP %d: %s", e.StatusCode, e.RedactedBody())
+}
+
+// RedactedBody returns the retained upstream response with credential-shaped
+// values masked. Callers that expose an HTTP error outside logs should still
+// select only the fields needed for that view instead of returning the whole
+// response body.
+func (e *HTTPError) RedactedBody() string {
+	if e == nil {
+		return ""
+	}
+	return redactBody(string(e.Body))
 }
 
 var (
-	sensitiveJSON   = regexp.MustCompile(`(?i)("(?:access_token|refresh_token|token|otp_token|verification_token|client_secret|device_token|authorization|phone|phone_number)"\s*:\s*")[^"]+(")`)
-	sensitivePair   = regexp.MustCompile(`(?i)(\b(?:access_token|refresh_token|token|otp_token|verification_token|client_secret|device_token|authorization)=)[^&\s]+`)
+	sensitiveJSON   = regexp.MustCompile(`(?i)("(?:access_token|refresh_token|token|otp_token|pin_otp_token|verification_token|1fa_token|2fa_token|one_fa_token|two_fa_token|client_secret|device_token|authorization|cookie|set_cookie|session|session_id|phone|phone_number|mobile|msisdn|email|email_address|otp|pin|password|passcode|account_id|user_id|device_id|unique_id|verification_id|pin_verification_id|verification_code|sms_code|challenge_id|transaction_id|proxy_url)"\s*:\s*")[^"]+(")`)
+	sensitivePair   = regexp.MustCompile(`(?i)(\b(?:access_token|refresh_token|token|otp_token|pin_otp_token|verification_token|1fa_token|2fa_token|one_fa_token|two_fa_token|client_secret|device_token|authorization|cookie|set_cookie|session|session_id|phone|phone_number|mobile|msisdn|email|email_address|otp|pin|password|passcode|account_id|user_id|device_id|unique_id|verification_id|pin_verification_id|verification_code|sms_code|challenge_id|transaction_id|proxy_url)\b\s*[:=]\s*["']?)[^&\s"',}\]]+`)
 	sensitiveBearer = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+`)
+	sensitiveNumber = regexp.MustCompile(`\b[0-9]{4,19}\b`)
+	sensitiveUUID   = regexp.MustCompile(`(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`)
+	sensitiveEmail  = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
 )
 
 func redactBody(value string) string {
+	value = sensitiveBearer.ReplaceAllString(value, `Bearer ***`)
 	value = sensitiveJSON.ReplaceAllString(value, `${1}***${2}`)
 	value = sensitivePair.ReplaceAllString(value, `${1}***`)
-	return sensitiveBearer.ReplaceAllString(value, `Bearer ***`)
+	return value
+}
+
+// RedactErrorDetail masks credential-shaped values plus numeric identifiers in
+// a small upstream message selected for display. It is deliberately more
+// conservative than RedactedBody, which is primarily intended for logs.
+func RedactErrorDetail(value string) string {
+	value = redactBody(value)
+	value = sensitiveUUID.ReplaceAllString(value, `***`)
+	value = sensitiveEmail.ReplaceAllString(value, `***`)
+	return sensitiveNumber.ReplaceAllString(value, `***`)
 }

@@ -79,6 +79,7 @@ var migrations = []migration{
 				purchase_price_amount numeric(18,6) NOT NULL,
 				currency text NOT NULL DEFAULT '',
 				status text NOT NULL DEFAULT 'purchased',
+				status_changed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
 				failure_reason text NOT NULL DEFAULT '',
 				balance_rp numeric(24,6),
 				balance_checked_at timestamptz,
@@ -284,6 +285,12 @@ var migrations = []migration{
 				CHECK (status NOT IN ('pending','running') OR purchased_count+purchase_reserved_count <= quantity)`,
 			`ALTER TABLE batches ADD CONSTRAINT batches_purchase_protocol_v1_chk
 				CHECK (purchase_protocol_version=1)`,
+		},
+	},
+	{
+		version: 6,
+		statements: []string{
+			`ALTER TABLE activations ADD COLUMN IF NOT EXISTS status_changed_at timestamptz NOT NULL DEFAULT clock_timestamp()`,
 		},
 	},
 }

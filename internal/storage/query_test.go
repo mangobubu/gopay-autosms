@@ -68,9 +68,51 @@ func TestMigrationHasAtomicDedupAndRestartIndexes(t *testing.T) {
 		"next_purchase_at timestamptz",
 		"purchased_count integer NOT NULL DEFAULT 0",
 		"config jsonb",
+		"status_changed_at timestamptz NOT NULL DEFAULT clock_timestamp()",
 	} {
 		if !strings.Contains(schema, required) {
 			t.Fatalf("schema missing %q", required)
+		}
+	}
+}
+
+func TestStatusChangedAtMigrationAndTransitionPreserveStateEntryTime(t *testing.T) {
+	var freshSchemaSQL, migrationSQL strings.Builder
+	for _, migration := range migrations {
+		if migration.version != 1 && migration.version != 6 {
+			continue
+		}
+		for _, statement := range migration.statements {
+			builder := &migrationSQL
+			if migration.version == 1 {
+				builder = &freshSchemaSQL
+			}
+			builder.WriteString(statement)
+			builder.WriteByte('\n')
+		}
+	}
+	if sql := freshSchemaSQL.String(); !strings.Contains(sql,
+		"status_changed_at timestamptz NOT NULL DEFAULT clock_timestamp()",
+	) {
+		t.Fatalf("fresh activation schema is missing status_changed_at: %s", sql)
+	}
+	if sql := migrationSQL.String(); !strings.Contains(sql,
+		"ADD COLUMN IF NOT EXISTS status_changed_at timestamptz NOT NULL DEFAULT clock_timestamp()",
+	) {
+		t.Fatalf("status timestamp migration is incomplete: %s", sql)
+	}
+
+	if !strings.Contains(activationColumns, "status, status_changed_at, failure_reason") {
+		t.Fatalf("activation scan columns do not expose status_changed_at beside status: %s", activationColumns)
+	}
+	for name, sql := range map[string]string{
+		"generic transition": transitionStatusChangedAtSQL,
+		"duplicate write":    duplicateStatusChangedAtSQL,
+	} {
+		if !strings.Contains(sql, "IS DISTINCT FROM") ||
+			!strings.Contains(sql, "THEN clock_timestamp()") ||
+			!strings.Contains(sql, "ELSE status_changed_at") {
+			t.Fatalf("%s does not update only on an actual status change: %s", name, sql)
 		}
 	}
 }

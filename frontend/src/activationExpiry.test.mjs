@@ -18,7 +18,7 @@ test('shows cancelled instead of an expiration time for a cancelled activation',
 })
 
 test('shows cancelled after a classified provider cancellation is finalized', () => {
-  for (const status of ['duplicate', 'pin_required', 'unregistered']) {
+  for (const status of ['duplicate', 'login_code_timeout', 'pin_required', 'unregistered']) {
     assert.deepEqual(
       activationExpiryPresentation(
         status,

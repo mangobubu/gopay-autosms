@@ -36,6 +36,21 @@ type loginFailureStore struct {
 	releases      int
 }
 
+func loginFailureSMSSetting(t *testing.T, box *secure.Box) domain.Setting {
+	t.Helper()
+	apiKeyCiphertext, err := box.Seal([]byte("fixture-api-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	settingValue, err := json.Marshal(map[string]string{
+		"api_key_encrypted": base64.StdEncoding.EncodeToString(apiKeyCiphertext),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return domain.Setting{Key: appsettings.SMSBowerKey, Value: settingValue}
+}
+
 func (s *loginFailureStore) ReleaseActivationLease(context.Context, int64, string, time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -98,19 +113,22 @@ func (s *loginFailureStore) FinalizeActivationOwned(
 
 func TestProcessActivationFinalizesKnownLoginFailures(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		status int
-		body   string
+		name       string
+		status     int
+		body       string
+		wantReason string
 	}{
 		{
-			name:   "GoPay-112",
-			status: http.StatusForbidden,
-			body:   `{"success":false,"errors":[{"code":"GoPay-112","message_title":"Akunmu diblokir sementara"}]}`,
+			name:       "GoPay-112",
+			status:     http.StatusForbidden,
+			body:       `{"success":false,"errors":[{"code":"GoPay-112","message_title":"Akunmu diblokir sementara"}]}`,
+			wantReason: "GoPay 登录失败（阶段：登录初始化；HTTP 403；错误码：GoPay-112；GoPay 信息：Akunmu diblokir sementara）",
 		},
 		{
-			name:   "auth error rate limited",
-			status: http.StatusTooManyRequests,
-			body:   `{"success":false,"errors":[{"code":"auth:error:ratelimited"}]}`,
+			name:       "auth error rate limited",
+			status:     http.StatusTooManyRequests,
+			body:       `{"success":false,"errors":[{"code":"auth:error:ratelimited"}]}`,
+			wantReason: "GoPay 登录失败（阶段：登录初始化；HTTP 429；错误码：auth:error:ratelimited；说明：GoPay 登录请求频率受限）",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -144,22 +162,11 @@ func TestProcessActivationFinalizesKnownLoginFailures(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			apiKeyCiphertext, err := box.Seal([]byte("fixture-api-key"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			settingValue, err := json.Marshal(map[string]string{
-				"api_key_encrypted": base64.StdEncoding.EncodeToString(apiKeyCiphertext),
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-
 			store := &loginFailureStore{
 				batch: domain.Batch{
 					ID: 11, CountryCode: "6", TargetPINEnc: pinCiphertext, Config: json.RawMessage(`{}`),
 				},
-				setting: domain.Setting{Key: appsettings.SMSBowerKey, Value: settingValue},
+				setting: loginFailureSMSSetting(t, box),
 			}
 			manager := New(
 				store,
@@ -187,7 +194,7 @@ func TestProcessActivationFinalizesKnownLoginFailures(t *testing.T) {
 				store.mu.Unlock()
 				t.Fatalf("SMSBower cancel calls=%d, want 1; transitions=%+v finalizations=%v releases=%d", cancelCalls, gotTransitions, gotFinalizations, gotReleases)
 			}
-			wantTransitions := []loginFailureTransition{{next: domain.ActivationStatusLoginFailed, reason: "登录失败"}}
+			wantTransitions := []loginFailureTransition{{next: domain.ActivationStatusLoginFailed, reason: test.wantReason}}
 			if !reflect.DeepEqual(transitions, wantTransitions) {
 				t.Fatalf("transitions=%+v, want %+v", transitions, wantTransitions)
 			}
@@ -196,5 +203,64 @@ func TestProcessActivationFinalizesKnownLoginFailures(t *testing.T) {
 				t.Fatalf("finalizations=%v, want %v", finalizations, wantFinalizations)
 			}
 		})
+	}
+}
+
+func TestProcessActivationPreservesLoginFailureDetailAcrossProviderRetry(t *testing.T) {
+	var cancelCalls int
+	smsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("action") != "setStatus" || r.URL.Query().Get("status") != "8" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		cancelCalls++
+		if cancelCalls == 1 {
+			http.Error(w, "temporary provider failure", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, "ACCESS_CANCEL")
+	}))
+	defer smsServer.Close()
+
+	box, err := secure.New("login-failure-provider-retry-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &loginFailureStore{setting: loginFailureSMSSetting(t, box)}
+	manager := New(
+		store,
+		appsettings.New(store, box, smsServer.URL),
+		box,
+		Config{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	const originalReason = "GoPay 操作失败（阶段：改 PIN 验证；HTTP 403；错误码：GoPay-112）"
+	activation := domain.Activation{
+		ID: 31, ProviderActivationID: "provider-activation-retry",
+		PhoneNumber: "+6281234567890", Status: domain.ActivationStatusLoginFailed,
+		FailureReason: originalReason, LeaseOwner: "worker-retry", LeaseVersion: 5,
+	}
+
+	manager.processActivation(context.Background(), activation)
+	manager.processActivation(context.Background(), activation)
+
+	store.mu.Lock()
+	transitions := append([]loginFailureTransition(nil), store.transitions...)
+	finalizations := append([][]domain.ActivationStatus(nil), store.finalizations...)
+	releases := store.releases
+	store.mu.Unlock()
+	if cancelCalls != 2 {
+		t.Fatalf("cancel calls=%d, want 2", cancelCalls)
+	}
+	wantTransitions := []loginFailureTransition{{next: domain.ActivationStatusLoginFailed, reason: originalReason}}
+	if !reflect.DeepEqual(transitions, wantTransitions) {
+		t.Fatalf("transitions=%+v, want %+v", transitions, wantTransitions)
+	}
+	wantFinalizations := [][]domain.ActivationStatus{{domain.ActivationStatusLoginFailed}}
+	if !reflect.DeepEqual(finalizations, wantFinalizations) {
+		t.Fatalf("finalizations=%v, want %v", finalizations, wantFinalizations)
+	}
+	if releases != 1 {
+		t.Fatalf("lease releases=%d, want 1 after the failed provider attempt", releases)
 	}
 }

@@ -23,7 +23,10 @@ import (
 	"github.com/mangobubu/gopay-autosms/internal/storage"
 )
 
-const purchaseCleanupWorkerCount = 4
+const (
+	purchaseCleanupWorkerCount = 4
+	loginCodeWaitTimeout       = 180 * time.Second
+)
 
 type Config struct {
 	PollInterval  time.Duration
@@ -842,11 +845,16 @@ func (m *Manager) processActivation(ctx context.Context, activation domain.Activ
 			} else {
 				err = m.probeAndStartLogin(ctx, activation)
 			}
-		case domain.ActivationStatusDuplicate, domain.ActivationStatusPINRequired, domain.ActivationStatusUnregistered, domain.ActivationStatusLoginFailed:
+		case domain.ActivationStatusDuplicate, domain.ActivationStatusPINRequired, domain.ActivationStatusUnregistered,
+			domain.ActivationStatusLoginFailed, domain.ActivationStatusLoginCodeTimeout:
 			err = m.finalizeProviderAction(ctx, activation, smsbower.SetStatusCancel)
 		case domain.ActivationStatusAwaitingLoginCode:
 			if m.activationExpired(activation) {
 				err = m.expireAndCancel(ctx, activation)
+			} else if loginCodeWaitTimedOut(activation, time.Now().UTC()) {
+				err = m.cancelAndClassifyFrom(ctx, activation,
+					[]domain.ActivationStatus{domain.ActivationStatusAwaitingLoginCode},
+					domain.ActivationStatusLoginCodeTimeout, "等待验证码超时")
 			} else {
 				err = m.pollLoginCode(ctx, activation)
 			}
@@ -894,10 +902,7 @@ func (m *Manager) processActivation(ctx context.Context, activation domain.Activ
 		// Keep the last actionable reason with the activation so the dashboard
 		// does not present a consumed/failed OTP as if it were still pending.
 		// This is best-effort: lease ownership remains the source of truth.
-		reason := err.Error()
-		if len(reason) > 500 {
-			reason = reason[:500]
-		}
+		reason := activationStepFailureReason(activation, err)
 		_, _ = m.store.TransitionActivationOwned(ctx, activation.ID,
 			[]domain.ActivationStatus{activation.Status}, activation.Status, reason,
 			activation.LeaseOwner, activation.LeaseVersion)
@@ -921,7 +926,7 @@ func (m *Manager) finalizeLoginFailure(ctx context.Context, activation domain.Ac
 	if !errors.Is(err, gopay.ErrLoginFailed) {
 		return err
 	}
-	return m.cancelAndClassify(ctx, activation, domain.ActivationStatusLoginFailed, "登录失败")
+	return m.cancelAndClassify(ctx, activation, domain.ActivationStatusLoginFailed, loginFailureReason(activation.Status, err))
 }
 
 func (m *Manager) acquireAccountSessionLock(ctx context.Context, phone string) (func(), error) {
@@ -1003,6 +1008,13 @@ func (m *Manager) releaseActivationProxy(ctx context.Context, activation domain.
 
 func (m *Manager) activationExpired(activation domain.Activation) bool {
 	return activation.ProviderExpiresAt != nil && time.Now().UTC().After(*activation.ProviderExpiresAt)
+}
+
+func loginCodeWaitTimedOut(activation domain.Activation, now time.Time) bool {
+	if activation.Status != domain.ActivationStatusAwaitingLoginCode || activation.StatusChangedAt.IsZero() {
+		return false
+	}
+	return now.After(activation.StatusChangedAt.Add(loginCodeWaitTimeout))
 }
 
 func (m *Manager) expireAndCancel(ctx context.Context, activation domain.Activation) error {
@@ -1109,7 +1121,17 @@ func (m *Manager) probeAndStartLogin(ctx context.Context, activation domain.Acti
 }
 
 func (m *Manager) cancelAndClassify(ctx context.Context, activation domain.Activation, status domain.ActivationStatus, reason string) error {
-	_, err := m.store.TransitionActivationOwned(ctx, activation.ID, nil, status, reason, activation.LeaseOwner, activation.LeaseVersion)
+	return m.cancelAndClassifyFrom(ctx, activation, nil, status, reason)
+}
+
+func (m *Manager) cancelAndClassifyFrom(
+	ctx context.Context,
+	activation domain.Activation,
+	expected []domain.ActivationStatus,
+	status domain.ActivationStatus,
+	reason string,
+) error {
+	_, err := m.store.TransitionActivationOwned(ctx, activation.ID, expected, status, reason, activation.LeaseOwner, activation.LeaseVersion)
 	if err != nil {
 		return err
 	}

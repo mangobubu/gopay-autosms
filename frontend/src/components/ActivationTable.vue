@@ -1,86 +1,124 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import { ElMessage, TableV2FixedDir } from 'element-plus'
-import type { Column } from 'element-plus'
+import { computed } from "vue";
+import { ElMessage, TableV2FixedDir } from "element-plus";
+import type { Column } from "element-plus";
 
-import { activationExpiryPresentation } from '../activationExpiry'
+import { activationExpiryPresentation } from "../activationExpiry";
 import {
   accountLoginStatus,
   activationStatus,
   formatNumber,
   formatTime,
-} from '../normalizers'
-import type { ActivationView, GoPayLoginStatusView } from '../types'
+} from "../normalizers";
+import type { ActivationView, GoPayLoginStatusView } from "../types";
 
-const ROW_HEIGHT = 92
-const HEADER_HEIGHT = 48
-const MAX_VISIBLE_ROWS = 7
+const ROW_HEIGHT = 92;
+const HEADER_HEIGHT = 48;
+const MAX_VISIBLE_ROWS = 7;
+const ERROR_COLUMN_MIN_WIDTH = 220;
+const TABLE_VERTICAL_SCROLLBAR_SIZE = 6;
 
 const props = defineProps<{
-  activations: ActivationView[]
-  busyById: Record<string, boolean>
-  getLoginStatus: (activation: ActivationView) => GoPayLoginStatusView | undefined
-  nowMs: number
-}>()
+  activations: ActivationView[];
+  busyById: Record<string, boolean>;
+  getLoginStatus: (
+    activation: ActivationView,
+  ) => GoPayLoginStatusView | undefined;
+  nowMs: number;
+}>();
 
 const emit = defineEmits<{
-  success: [activation: ActivationView]
-  delete: [activation: ActivationView]
-}>()
+  success: [activation: ActivationView];
+  delete: [activation: ActivationView];
+}>();
 
 const columns: Column[] = [
   {
-    key: 'phone',
-    dataKey: 'phone',
-    title: '手机号码 / ID',
+    key: "phone",
+    dataKey: "phone",
+    title: "手机号码 / ID",
     width: 218,
-    fixed: TableV2FixedDir.LEFT,
   },
-  { key: 'status', dataKey: 'status', title: '激活状态', width: 142 },
-  { key: 'loginStatus', dataKey: 'loginStatus', title: 'GoPay 登录', width: 182 },
-  { key: 'balance', dataKey: 'balance', title: '余额', width: 112 },
-  { key: 'provider', dataKey: 'provider', title: '供应商', width: 124 },
-  { key: 'expiresAt', dataKey: 'expiresAt', title: '到期时间', width: 166 },
-  { key: 'loginCode', dataKey: 'loginCode', title: '登录验证码', width: 136 },
-  { key: 'pinCode', dataKey: 'pinCode', title: '改 PIN 验证码', width: 146 },
-  { key: 'subsequentCodes', dataKey: 'subsequentCodes', title: '后续验证码', width: 238 },
-  { key: 'error', dataKey: 'error', title: '错误信息', width: 220 },
+  { key: "status", dataKey: "status", title: "激活状态", width: 142 },
   {
-    key: 'actions',
-    dataKey: 'actions',
-    title: '操作',
-    width: 132,
-    align: 'center',
-    fixed: TableV2FixedDir.RIGHT,
+    key: "loginStatus",
+    dataKey: "loginStatus",
+    title: "GoPay 登录",
+    width: 182,
   },
-]
+  { key: "balance", dataKey: "balance", title: "余额", width: 112 },
+  { key: "provider", dataKey: "provider", title: "供应商", width: 124 },
+  { key: "expiresAt", dataKey: "expiresAt", title: "到期时间", width: 166 },
+  { key: "loginCode", dataKey: "loginCode", title: "登录验证码", width: 136 },
+  { key: "pinCode", dataKey: "pinCode", title: "改 PIN 验证码", width: 146 },
+  {
+    key: "subsequentCodes",
+    dataKey: "subsequentCodes",
+    title: "后续验证码",
+    width: 238,
+  },
+  {
+    key: "error",
+    dataKey: "error",
+    title: "错误信息",
+    width: ERROR_COLUMN_MIN_WIDTH,
+  },
+  {
+    key: "actions",
+    dataKey: "actions",
+    title: "操作",
+    width: 132,
+    align: "center",
+  },
+];
 
 const compactColumns: Column[] = columns.map((column) => ({
   ...column,
   fixed: undefined,
-}))
+}));
 
-const tableHeight = computed(() => (
-  HEADER_HEIGHT
-  + Math.min(props.activations.length, MAX_VISIBLE_ROWS) * ROW_HEIGHT
-  + 12
-))
+const nonErrorColumnsWidth = columns.reduce(
+  (width, column) =>
+    column.dataKey === "error" ? width : width + column.width,
+  0,
+);
+
+const tableHeight = computed(
+  () =>
+    HEADER_HEIGHT +
+    Math.min(props.activations.length, MAX_VISIBLE_ROWS) * ROW_HEIGHT +
+    12,
+);
 
 function columnsForWidth(width: number): Column[] {
-  return width < 720 ? compactColumns : columns
+  const baseColumns = width < 720 ? compactColumns : columns;
+  const errorColumnWidth = Math.max(
+    ERROR_COLUMN_MIN_WIDTH,
+    width - TABLE_VERTICAL_SCROLLBAR_SIZE - nonErrorColumnsWidth,
+  );
+
+  if (errorColumnWidth === ERROR_COLUMN_MIN_WIDTH) return baseColumns;
+
+  return baseColumns.map((column) =>
+    column.dataKey === "error"
+      ? { ...column, width: errorColumnWidth }
+      : column,
+  );
 }
 
 function statusMeta(activation: ActivationView) {
-  return activationStatus(activation.status)
+  return activationStatus(activation.status);
 }
 
-function loginStatus(activation: ActivationView): GoPayLoginStatusView | undefined {
-  return props.getLoginStatus(activation)
+function loginStatus(
+  activation: ActivationView,
+): GoPayLoginStatusView | undefined {
+  return props.getLoginStatus(activation);
 }
 
 function loginMeta(activation: ActivationView) {
-  const status = loginStatus(activation)
-  return status ? accountLoginStatus(status.status) : undefined
+  const status = loginStatus(activation);
+  return status ? accountLoginStatus(status.status) : undefined;
 }
 
 function expiry(activation: ActivationView) {
@@ -89,52 +127,67 @@ function expiry(activation: ActivationView) {
     activation.expiresAt,
     activation.finishedAt,
     props.nowMs,
-  )
+  );
 }
 
 function canOperate(activation: ActivationView): boolean {
-  return !activation.finishedAt
-    && ['polling', 'active', 'awaiting_subsequent_code'].includes(activation.status)
+  return (
+    !activation.finishedAt &&
+    ["polling", "active", "awaiting_subsequent_code"].includes(
+      activation.status,
+    )
+  );
 }
 
 function isPolling(activation: ActivationView): boolean {
-  return !activation.finishedAt
-    && ['polling', 'active', 'awaiting_subsequent_code', 'pin_changed'].includes(activation.status)
+  return (
+    !activation.finishedAt &&
+    ["polling", "active", "awaiting_subsequent_code", "pin_changed"].includes(
+      activation.status,
+    )
+  );
 }
 
-function rowClass({ rowData, rowIndex }: { rowData: ActivationView; rowIndex: number }): string {
+function rowClass({
+  rowData,
+  rowIndex,
+}: {
+  rowData: ActivationView;
+  rowIndex: number;
+}): string {
   return [
-    'activation-table-row',
-    rowIndex % 2 ? 'activation-table-row--striped' : '',
-    isPolling(rowData) ? 'activation-table-row--polling' : '',
-  ].filter(Boolean).join(' ')
+    "activation-table-row",
+    rowIndex % 2 ? "activation-table-row--striped" : "",
+    isPolling(rowData) ? "activation-table-row--polling" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 function subsequentCodesTitle(activation: ActivationView): string {
   return activation.subsequentCodes
     .map((item, index) => {
-      const receivedAt = item.receivedAt ? ` · ${formatTime(item.receivedAt)}` : ''
-      return `${index + 1}. ${item.code}${receivedAt}`
+      const receivedAt = item.receivedAt
+        ? ` · ${formatTime(item.receivedAt)}`
+        : "";
+      return `${index + 1}. ${item.code}${receivedAt}`;
     })
-    .join('\n')
+    .join("\n");
 }
 
 async function copyPhone(activation: ActivationView): Promise<void> {
-  if (!activation.phone || activation.phone === '—') return
+  if (!activation.phone || activation.phone === "—") return;
   try {
-    await navigator.clipboard.writeText(activation.phone)
-    ElMessage.success('号码已复制')
+    await navigator.clipboard.writeText(activation.phone);
+    ElMessage.success("号码已复制");
   } catch {
-    ElMessage.warning('复制失败，请手动选择号码')
+    ElMessage.warning("复制失败，请手动选择号码");
   }
 }
 </script>
 
 <template>
-  <div
-    class="activation-table-shell"
-    :style="{ height: `${tableHeight}px` }"
-  >
+  <div class="activation-table-shell" :style="{ height: `${tableHeight}px` }">
     <el-auto-resizer>
       <template #default="{ height, width }">
         <el-table-v2
@@ -146,13 +199,17 @@ async function copyPhone(activation: ActivationView): Promise<void> {
           :header-height="HEADER_HEIGHT"
           :row-height="ROW_HEIGHT"
           :row-class="rowClass"
+          :v-scrollbar-size="TABLE_VERTICAL_SCROLLBAR_SIZE"
           :cache="4"
           row-key="id"
           fixed
           scrollbar-always-on
         >
           <template #cell="{ column, rowData }">
-            <div v-if="column.dataKey === 'phone'" class="activation-table__identity">
+            <div
+              v-if="column.dataKey === 'phone'"
+              class="activation-table__identity"
+            >
               <button
                 class="activation-table__phone"
                 type="button"
@@ -162,41 +219,77 @@ async function copyPhone(activation: ActivationView): Promise<void> {
                 <span>{{ rowData.phone }}</span>
                 <span class="activation-table__copy" aria-hidden="true">⧉</span>
               </button>
-              <span class="activation-table__reference" :title="rowData.activationId || rowData.id">
+              <span
+                class="activation-table__reference"
+                :title="rowData.activationId || rowData.id"
+              >
                 ID&nbsp; {{ rowData.activationId || rowData.id }}
               </span>
             </div>
 
-            <div v-else-if="column.dataKey === 'status'" class="activation-table__stack">
-              <el-tag :type="statusMeta(rowData).type" effect="light" round size="small">
-                <span v-if="statusMeta(rowData).active" class="status-pulse" aria-hidden="true" />
+            <div
+              v-else-if="column.dataKey === 'status'"
+              class="activation-table__stack"
+            >
+              <el-tag
+                :type="statusMeta(rowData).type"
+                effect="light"
+                round
+                size="small"
+              >
+                <span
+                  v-if="statusMeta(rowData).active"
+                  class="status-pulse"
+                  aria-hidden="true"
+                />
                 {{ statusMeta(rowData).label }}
               </el-tag>
-              <small v-if="isPolling(rowData)" class="activation-table__polling">每 2 秒轮询</small>
+              <small v-if="isPolling(rowData)" class="activation-table__polling"
+                >每 2 秒轮询</small
+              >
             </div>
 
             <div
               v-else-if="column.dataKey === 'loginStatus'"
               class="activation-table__login"
-              :class="loginStatus(rowData) ? `is-${loginStatus(rowData)?.status}` : ''"
+              :class="
+                loginStatus(rowData) ? `is-${loginStatus(rowData)?.status}` : ''
+              "
               :title="loginStatus(rowData)?.message"
             >
               <template v-if="loginStatus(rowData) && loginMeta(rowData)">
                 <strong>
-                  <span class="activation-table__login-dot" aria-hidden="true" />
+                  <span
+                    class="activation-table__login-dot"
+                    aria-hidden="true"
+                  />
                   GoPay · {{ loginMeta(rowData)?.label }}
                 </strong>
                 <small v-if="loginStatus(rowData)?.checkedAt">
                   检查于 {{ formatTime(loginStatus(rowData)?.checkedAt) }}
                 </small>
-                <small v-if="loginStatus(rowData)?.refreshed">已自动刷新登录凭据</small>
+                <small v-if="loginStatus(rowData)?.refreshed"
+                  >已自动刷新登录凭据</small
+                >
               </template>
               <span v-else class="activation-table__muted">—</span>
             </div>
 
-            <div v-else-if="column.dataKey === 'balance'" class="activation-table__stack">
-              <strong :class="{ 'activation-table__balance-positive': (rowData.balance ?? 0) >= 1 }">
-                {{ rowData.balance === undefined ? '查询中' : `${formatNumber(rowData.balance)} RP` }}
+            <div
+              v-else-if="column.dataKey === 'balance'"
+              class="activation-table__stack"
+            >
+              <strong
+                :class="{
+                  'activation-table__balance-positive':
+                    (rowData.balance ?? 0) >= 1,
+                }"
+              >
+                {{
+                  rowData.balance === undefined
+                    ? "查询中"
+                    : `${formatNumber(rowData.balance)} RP`
+                }}
               </strong>
             </div>
 
@@ -205,12 +298,18 @@ async function copyPhone(activation: ActivationView): Promise<void> {
               class="activation-table__ellipsis"
               :title="rowData.provider || '—'"
             >
-              {{ rowData.provider || '—' }}
+              {{ rowData.provider || "—" }}
             </span>
 
-            <div v-else-if="column.dataKey === 'expiresAt'" class="activation-table__stack">
+            <div
+              v-else-if="column.dataKey === 'expiresAt'"
+              class="activation-table__stack"
+            >
               <strong>{{ expiry(rowData).label }}</strong>
-              <small v-if="expiry(rowData).countdown" class="activation-table__countdown">
+              <small
+                v-if="expiry(rowData).countdown"
+                class="activation-table__countdown"
+              >
                 倒计时 {{ expiry(rowData).countdown }}
               </small>
             </div>
@@ -220,7 +319,7 @@ async function copyPhone(activation: ActivationView): Promise<void> {
               class="activation-table__code"
               :class="{ 'is-waiting': !rowData.loginCode }"
             >
-              {{ rowData.loginCode || '等待接收' }}
+              {{ rowData.loginCode || "等待接收" }}
             </code>
 
             <code
@@ -228,7 +327,7 @@ async function copyPhone(activation: ActivationView): Promise<void> {
               class="activation-table__code"
               :class="{ 'is-waiting': !rowData.pinCode }"
             >
-              {{ rowData.pinCode || '等待接收' }}
+              {{ rowData.pinCode || "等待接收" }}
             </code>
 
             <div
@@ -245,7 +344,7 @@ async function copyPhone(activation: ActivationView): Promise<void> {
                 </code>
               </template>
               <span v-else class="activation-table__muted">
-                {{ isPolling(rowData) ? '等待新的验证码…' : '暂无验证码' }}
+                {{ isPolling(rowData) ? "等待新的验证码…" : "暂无验证码" }}
               </span>
             </div>
 
@@ -256,10 +355,13 @@ async function copyPhone(activation: ActivationView): Promise<void> {
               :title="rowData.error"
             >
               <span v-if="rowData.error" aria-hidden="true">!</span>
-              {{ rowData.error || '—' }}
+              {{ rowData.error || "—" }}
             </span>
 
-            <div v-else-if="column.dataKey === 'actions'" class="activation-table__actions">
+            <div
+              v-else-if="column.dataKey === 'actions'"
+              class="activation-table__actions"
+            >
               <template v-if="canOperate(rowData)">
                 <el-button
                   type="success"

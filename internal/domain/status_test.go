@@ -56,6 +56,7 @@ func TestTerminalStatuses(t *testing.T) {
 		ActivationStatusPINRequired,
 		ActivationStatusUnregistered,
 		ActivationStatusLoginFailed,
+		ActivationStatusLoginCodeTimeout,
 		ActivationStatusZeroBalanceUsed,
 		ActivationStatusSettingPIN,
 		ActivationStatusPINChanged,
@@ -64,6 +65,15 @@ func TestTerminalStatuses(t *testing.T) {
 		if status.Terminal() {
 			t.Fatalf("%q must stay recoverable until remote finalization succeeds", status)
 		}
+	}
+}
+
+func TestLoginCodeTimeoutStatusIsValidAndNonTerminal(t *testing.T) {
+	if !ActivationStatusLoginCodeTimeout.Valid() {
+		t.Fatal("login_code_timeout must be a valid activation status")
+	}
+	if ActivationStatusLoginCodeTimeout.Terminal() {
+		t.Fatal("login_code_timeout must remain non-terminal until provider cancellation is finalized")
 	}
 }
 

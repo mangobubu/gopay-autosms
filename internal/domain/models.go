@@ -62,6 +62,7 @@ const (
 	ActivationStatusPINRequired            ActivationStatus = "pin_required"
 	ActivationStatusUnregistered           ActivationStatus = "unregistered"
 	ActivationStatusLoginFailed            ActivationStatus = "login_failed"
+	ActivationStatusLoginCodeTimeout       ActivationStatus = "login_code_timeout"
 	ActivationStatusCheckingBalance        ActivationStatus = "checking_balance"
 	ActivationStatusZeroBalanceUsed        ActivationStatus = "zero_balance_used"
 	ActivationStatusSettingPIN             ActivationStatus = "setting_pin"
@@ -99,6 +100,7 @@ type Activation struct {
 	PurchasePriceAmount  string           `json:"purchase_price_amount"`
 	Currency             string           `json:"currency"`
 	Status               ActivationStatus `json:"status"`
+	StatusChangedAt      time.Time        `json:"status_changed_at"`
 	FailureReason        string           `json:"failure_reason,omitempty"`
 	BalanceRP            *float64         `json:"balance_rp,omitempty"`
 	BalanceCheckedAt     *time.Time       `json:"balance_checked_at,omitempty"`

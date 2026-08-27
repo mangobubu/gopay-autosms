@@ -517,6 +517,7 @@ const statusMap: Record<string, StatusMeta> = {
   duplicate: { label: '重复号码', type: 'warning', active: false },
   checking_login: { label: '校验号码', type: 'primary', active: true },
   awaiting_login_code: { label: '等待登录验证码', type: 'warning', active: true },
+  login_code_timeout: { label: '等待验证码超时', type: 'danger', active: false },
   logging_in: { label: '正在登录', type: 'primary', active: true },
   waiting_login_otp: { label: '等待登录验证码', type: 'warning', active: true },
   pin_required: { label: '需要 PIN，已丢弃', type: 'danger', active: false },
