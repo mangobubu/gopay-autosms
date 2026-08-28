@@ -25,16 +25,11 @@ import {
   normalizeSettings,
 } from './normalizers'
 import {
-  loadApiKey,
-  loadBatchForm,
-  mergeClientApiKey,
-  safeGetItem,
-  safeRemoveItem,
-  safeSetItem,
-  saveApiKey,
-  saveBatchForm,
+  clearLegacyClientPersistence,
+  DEFAULT_BATCH_FORM,
+  normalizeBatchForm,
 } from './persistence'
-import type { ClientBatchForm, ClientPriceSnapshot, StorageLike } from './persistence'
+import type { ClientBatchForm, ClientPriceSnapshot } from './persistence'
 import type {
   ActivationView,
   BatchView,
@@ -52,26 +47,21 @@ const POLL_INTERVAL_MS = 2_000
 const LOGIN_STATUS_POLL_INTERVAL_MS = 5_000
 const LOGIN_STATUS_REQUEST_TIMEOUT_MS = 20_000
 const CLOCK_INTERVAL_MS = 1_000
-const ACTIVE_BATCH_KEY = 'gopay-autosms.active-batch'
+const BATCH_DRAFT_SAVE_DELAY_MS = 500
+const BATCH_DRAFT_RETRY_MAX_MS = 30_000
 type ServiceCatalogLoadResult = 'loaded' | 'failed' | 'stale'
-const localStorageAccess: StorageLike | undefined = (() => {
-  try {
-    return globalThis.localStorage
-  } catch {
-    return undefined
-  }
-})()
-const persistedBatchForm = loadBatchForm()
-const persistedPriceSnapshot = persistedBatchForm.priceSnapshot
+type PendingBatchDraft = { draft: ClientBatchForm, signature: string, keepalive: boolean }
 
-const smsProvider = ref<SMSProvider>(persistedBatchForm.smsProvider)
+let legacyClientPersistenceCleared = clearLegacyClientPersistence()
+
+const smsProvider = ref<SMSProvider>(DEFAULT_BATCH_FORM.smsProvider)
 const settingsByProvider = reactive<Record<SMSProvider, SMSProviderSettings>>({
   smsbower: {
-    apiKey: loadApiKey('smsbower'),
+    apiKey: '',
     configured: false,
   },
   'hero-sms': {
-    apiKey: loadApiKey('hero-sms'),
+    apiKey: '',
     configured: false,
   },
 })
@@ -96,12 +86,12 @@ const countryQuery = ref('')
 
 const batchFormRef = ref<FormInstance>()
 const form = reactive({
-  service: persistedBatchForm.service,
-  country: persistedBatchForm.country,
-  priceKey: persistedBatchForm.priceKey,
-  quantity: persistedBatchForm.quantity,
-  pin: persistedBatchForm.pin,
-  proxy: persistedBatchForm.proxy,
+  service: DEFAULT_BATCH_FORM.service,
+  country: DEFAULT_BATCH_FORM.country,
+  priceKey: DEFAULT_BATCH_FORM.priceKey,
+  quantity: DEFAULT_BATCH_FORM.quantity,
+  pin: DEFAULT_BATCH_FORM.pin,
+  proxy: DEFAULT_BATCH_FORM.proxy,
 })
 
 const proxyInputCount = computed(() => form.proxy.split(/\r?\n/).map((item) => item.trim()).filter(Boolean).length)
@@ -139,8 +129,13 @@ const starting = ref(false)
 const stoppingBatch = ref(false)
 const refreshing = ref(false)
 const connectionError = ref('')
+const batchDraftLoadError = ref('')
+const batchDraftSaveError = ref('')
+const visibleConnectionError = computed(() => (
+  batchDraftLoadError.value || batchDraftSaveError.value || connectionError.value
+))
 const currentBatch = ref<BatchView | null>(null)
-const currentBatchId = ref(safeGetItem(localStorageAccess, ACTIVE_BATCH_KEY) ?? '')
+const currentBatchId = ref('')
 const activeBatchLoading = ref(true)
 const activations = ref<ActivationView[]>([])
 const actionBusy = reactive<Record<string, boolean>>({})
@@ -150,10 +145,19 @@ const loginStatusRefreshing = ref(false)
 let pollTimer: number | undefined
 let loginStatusPollTimer: number | undefined
 let clockTimer: number | undefined
+let batchDraftSaveTimer: number | undefined
+let batchDraftSaveRetryTimer: number | undefined
+let batchDraftLoadRetryTimer: number | undefined
 let loginStatusAbortController: AbortController | undefined
 let disposed = false
-let restoringBatchForm = true
-let restoringCatalogDraft: ClientBatchForm | undefined = persistedBatchForm
+let batchDraftPersistenceReady = false
+let lastPersistedBatchDraftSignature = ''
+let lastQueuedBatchDraftSignature = ''
+let batchDraftSaveQueue: Promise<void> = Promise.resolve()
+let batchDraftSaveInFlight = false
+let batchDraftSaveRetryAttempt = 0
+let batchDraftLoadRetryAttempt = 0
+let pendingBatchDraft: PendingBatchDraft | undefined
 let catalogRestoreVersion = 0
 let catalogActionVersion = 0
 let serviceRequestVersion = 0
@@ -161,8 +165,9 @@ let countryRequestVersion = 0
 let priceRequestVersion = 0
 let settingsRequestVersion = 0
 let dashboardGeneration = 0
-let lastPriceSnapshot = persistedPriceSnapshot
-let lastPriceSnapshotKey = persistedBatchForm.priceKey
+let lastPriceSnapshot: ClientPriceSnapshot | undefined
+let lastPriceSnapshotKey = ''
+let heroSmsNavigationPending = false
 
 const selectedPrice = computed(() => prices.value.find((item) => item.key === form.priceKey))
 const selectedService = computed(() => services.value.find((item) => item.value === form.service))
@@ -225,31 +230,179 @@ function currentBatchFormDraft(): ClientBatchForm {
   return draft
 }
 
-function persistBatchFormDraft(): ClientBatchForm {
-  const draft = currentBatchFormDraft()
-  saveBatchForm(draft)
-  return draft
+function batchDraftSignature(draft: ClientBatchForm): string {
+  return JSON.stringify(normalizeBatchForm(draft))
 }
 
-function draftForCatalogRestore(): ClientBatchForm {
-  if (!restoringBatchForm || !restoringCatalogDraft) return persistBatchFormDraft()
+function applyBatchFormDraft(draft: ClientBatchForm): void {
+  lastPriceSnapshot = draft.priceSnapshot ? { ...draft.priceSnapshot } : undefined
+  lastPriceSnapshotKey = draft.priceKey
+  smsProvider.value = draft.smsProvider
+  Object.assign(form, {
+    service: draft.service,
+    country: draft.country,
+    priceKey: draft.priceKey,
+    quantity: draft.quantity,
+    pin: draft.pin,
+    proxy: draft.proxy,
+  })
+}
 
-  const draft: ClientBatchForm = {
-    ...restoringCatalogDraft,
-    smsProvider: smsProvider.value,
-    quantity: form.quantity,
-    pin: form.pin,
-    proxy: form.proxy,
+function retryDelay(attempt: number): number {
+  return Math.min(BATCH_DRAFT_RETRY_MAX_MS, 1_000 * (2 ** Math.min(attempt, 5)))
+}
+
+function scheduleBatchDraftSaveRetry(): void {
+  if (disposed || !batchDraftPersistenceReady || !pendingBatchDraft
+    || batchDraftSaveRetryTimer !== undefined) return
+  const delay = retryDelay(batchDraftSaveRetryAttempt)
+  batchDraftSaveRetryTimer = window.setTimeout(() => {
+    batchDraftSaveRetryTimer = undefined
+    void flushBatchDraftSave()
+  }, delay)
+}
+
+function flushBatchDraftSave(): Promise<void> {
+  if (!batchDraftPersistenceReady || !pendingBatchDraft) return Promise.resolve()
+  if (batchDraftSaveInFlight) return batchDraftSaveQueue
+  if (batchDraftSaveRetryTimer !== undefined) {
+    window.clearTimeout(batchDraftSaveRetryTimer)
+    batchDraftSaveRetryTimer = undefined
   }
-  saveBatchForm(draft)
-  return draft
+
+  batchDraftSaveInFlight = true
+  batchDraftSaveQueue = (async () => {
+    while (pendingBatchDraft) {
+      const pending: PendingBatchDraft = pendingBatchDraft
+      try {
+        const saved = normalizeBatchForm(await api.saveBatchDraft(pending.draft, pending.keepalive))
+        lastPersistedBatchDraftSignature = batchDraftSignature(saved)
+        if (pendingBatchDraft?.signature === pending.signature) pendingBatchDraft = undefined
+        lastQueuedBatchDraftSignature = pendingBatchDraft?.signature ?? lastPersistedBatchDraftSignature
+        batchDraftSaveRetryAttempt = 0
+        batchDraftSaveError.value = ''
+      } catch (error) {
+        batchDraftSaveRetryAttempt += 1
+        batchDraftSaveError.value = `任务草稿保存失败，正在后台重试：${friendlyError(error)}`
+        scheduleBatchDraftSaveRetry()
+        return
+      }
+    }
+  })().finally(() => {
+    batchDraftSaveInFlight = false
+  })
+  return batchDraftSaveQueue
+}
+
+function enqueueBatchDraftSave(draft: ClientBatchForm, keepalive = false): Promise<void> {
+  const normalized = normalizeBatchForm(draft)
+  const signature = batchDraftSignature(normalized)
+  if (signature === lastPersistedBatchDraftSignature && !pendingBatchDraft) return Promise.resolve()
+  if (signature === lastQueuedBatchDraftSignature && pendingBatchDraft) {
+    pendingBatchDraft.keepalive ||= keepalive
+    return flushBatchDraftSave()
+  }
+  lastQueuedBatchDraftSignature = signature
+  pendingBatchDraft = { draft: normalized, signature, keepalive }
+  return flushBatchDraftSave()
+}
+
+function scheduleBatchDraftSave(): void {
+  if (!batchDraftPersistenceReady || disposed) return
+  if (batchDraftSaveTimer !== undefined) window.clearTimeout(batchDraftSaveTimer)
+  batchDraftSaveTimer = window.setTimeout(() => {
+    batchDraftSaveTimer = undefined
+    void enqueueBatchDraftSave(currentBatchFormDraft())
+  }, BATCH_DRAFT_SAVE_DELAY_MS)
+}
+
+async function openHeroSmsPage(): Promise<void> {
+  if (heroSmsNavigationPending) return
+  heroSmsNavigationPending = true
+  if (batchDraftSaveTimer !== undefined) {
+    window.clearTimeout(batchDraftSaveTimer)
+    batchDraftSaveTimer = undefined
+  }
+  if (batchDraftPersistenceReady) await enqueueBatchDraftSave(currentBatchFormDraft())
+  await batchDraftSaveQueue
+  if (pendingBatchDraft) {
+    heroSmsNavigationPending = false
+    ElMessage.error('任务草稿尚未写入数据库，请等待后台重试成功后再打开新页面')
+    return
+  }
+  window.location.assign('/hero-sms')
+}
+
+async function loadBatchFormDraft(): Promise<ClientBatchForm | null> {
+  try {
+    const draft = normalizeBatchForm(await api.getBatchDraft())
+    batchDraftLoadError.value = ''
+    batchDraftLoadRetryAttempt = 0
+    return draft
+  } catch (error) {
+    batchDraftLoadError.value = `任务草稿读取失败，自动保存已暂停并会继续重试：${friendlyError(error)}`
+    return null
+  }
+}
+
+function activateBatchDraftPersistence(draft: ClientBatchForm): void {
+  applyBatchFormDraft(draft)
+  lastPersistedBatchDraftSignature = batchDraftSignature(draft)
+  lastQueuedBatchDraftSignature = lastPersistedBatchDraftSignature
+  batchDraftPersistenceReady = true
+  scheduleBatchDraftSave()
+}
+
+function scheduleBatchDraftLoadRetry(): void {
+  if (disposed || batchDraftPersistenceReady || batchDraftLoadRetryTimer !== undefined) return
+  const delay = retryDelay(batchDraftLoadRetryAttempt)
+  batchDraftLoadRetryAttempt += 1
+  batchDraftLoadRetryTimer = window.setTimeout(async () => {
+    batchDraftLoadRetryTimer = undefined
+    const draft = await loadBatchFormDraft()
+    if (disposed) return
+    if (!draft) {
+      scheduleBatchDraftLoadRetry()
+      return
+    }
+    const changedWhileOffline = batchDraftSignature(currentBatchFormDraft())
+      !== batchDraftSignature(DEFAULT_BATCH_FORM)
+    activateBatchDraftPersistence(draft)
+    if (settingsReady.value) await restoreBatchFormCatalog(draft)
+    if (changedWhileOffline) ElMessage.warning('数据库连接已恢复，页面已重新载入数据库中的任务草稿')
+  }, delay)
+}
+
+function handleBrowserOnline(): void {
+  if (!legacyClientPersistenceCleared) {
+    legacyClientPersistenceCleared = clearLegacyClientPersistence()
+  }
+  if (!batchDraftPersistenceReady) scheduleBatchDraftLoadRetry()
+  if (pendingBatchDraft) void flushBatchDraftSave()
+}
+
+function flushBatchDraftOnPageHide(): void {
+  if (batchDraftPersistenceReady) void enqueueBatchDraftSave(currentBatchFormDraft(), true)
+}
+
+watch(() => ({
+  smsProvider: smsProvider.value,
+  service: form.service,
+  country: form.country,
+  priceKey: form.priceKey,
+  quantity: form.quantity,
+  pin: form.pin,
+  proxy: form.proxy,
+  priceSnapshot: selectedPrice.value ? snapshotPrice(selectedPrice.value) : undefined,
+}), scheduleBatchDraftSave, { deep: true })
+
+function draftForCatalogRestore(): ClientBatchForm {
+  return currentBatchFormDraft()
 }
 
 function cancelBatchFormCatalogRestore(): void {
   catalogRestoreVersion += 1
   catalogActionVersion += 1
-  restoringBatchForm = false
-  restoringCatalogDraft = undefined
 }
 
 function finishBatchFormCatalogRestore(
@@ -258,27 +411,8 @@ function finishBatchFormCatalogRestore(
   ready = true,
 ): void {
   if (restoreVersion !== catalogRestoreVersion || provider !== smsProvider.value) return
-  restoringBatchForm = false
-  restoringCatalogDraft = undefined
   catalogReady.value = ready
-  persistBatchFormDraft()
 }
-
-SMS_PROVIDERS.forEach(({ value: provider }) => {
-  watch(() => settingsByProvider[provider].apiKey, (apiKey) => {
-    if (apiKey.trim() || !settingsByProvider[provider].configured) {
-      saveApiKey(apiKey, provider)
-    }
-  })
-})
-
-watch(form, () => {
-  if (restoringBatchForm) {
-    draftForCatalogRestore()
-    return
-  }
-  persistBatchFormDraft()
-}, { deep: true })
 
 function friendlyError(error: unknown): string {
   if (error instanceof ApiError) return error.message
@@ -297,7 +431,7 @@ function resetCountryQuery(): void {
   countryQuery.value = ''
 }
 
-async function restoreActiveBatchFromServer(): Promise<void> {
+async function restoreLatestBatchFromServer(): Promise<void> {
   try {
     const payload = await api.getBatches()
     const root = payload && typeof payload === 'object' && !Array.isArray(payload)
@@ -306,17 +440,17 @@ async function restoreActiveBatchFromServer(): Promise<void> {
     const rawBatches = Array.isArray(root?.batches)
       ? root.batches
       : Array.isArray(payload) ? payload : []
-    const activeBatch = rawBatches
-      .map((item) => normalizeBatch(item))
-      .find((batch) => batch.id && (batch.status === 'pending' || batch.status === 'running'))
-    if (!activeBatch || disposed) return
+    const batches = rawBatches.map((item) => normalizeBatch(item)).filter((batch) => batch.id)
+    const restoredBatch = batches.find((batch) => (
+      batch.status === 'pending' || batch.status === 'running'
+    )) ?? batches[0]
+    if (!restoredBatch || disposed) return
 
-    if (currentBatchId.value !== activeBatch.id || currentBatch.value?.status !== activeBatch.status) {
+    if (currentBatchId.value !== restoredBatch.id || currentBatch.value?.status !== restoredBatch.status) {
       dashboardGeneration += 1
-      currentBatchId.value = activeBatch.id
-      currentBatch.value = activeBatch
+      currentBatchId.value = restoredBatch.id
+      currentBatch.value = restoredBatch
       activations.value = []
-      safeSetItem(localStorageAccess, ACTIVE_BATCH_KEY, activeBatch.id)
     }
   } catch {
     // The regular dashboard request below still restores a persisted task when available.
@@ -436,10 +570,9 @@ async function loadSettings(provider: SMSProvider = smsProvider.value): Promise<
     const loaded = normalizeSettings(payload)
     const providerSettings = settingsByProvider[provider]
     providerSettings.configured = loaded.configured
-    // The endpoint deliberately returns a masked key. Keep the locally
-    // persisted plaintext in the input instead of replacing it with the mask.
-    const clientApiKey = providerSettings.apiKey.trim() || loadApiKey(provider)
-    providerSettings.apiKey = mergeClientApiKey(clientApiKey, loaded.apiKey)
+    // The API key is stored by the server. The browser only displays the masked
+    // value returned by the settings endpoint.
+    providerSettings.apiKey = loaded.apiKey
     connectionError.value = ''
   } catch (error) {
     if (requestVersion === settingsRequestVersion && provider === smsProvider.value && !disposed) {
@@ -468,7 +601,6 @@ async function saveSettings(): Promise<void> {
       apiKey,
     }, provider)
     if (provider !== smsProvider.value || disposed) return
-    if (apiKey) saveApiKey(apiKey, provider)
     connectionError.value = ''
     ElMessage.success(`${profile.displayName} 配置已保存`)
     await loadSettings(provider)
@@ -478,7 +610,6 @@ async function saveSettings(): Promise<void> {
     } else {
       cancelBatchFormCatalogRestore()
       catalogReady.value = false
-      persistBatchFormDraft()
     }
   } catch (error) {
     if (provider === smsProvider.value && !disposed) ElMessage.error(friendlyError(error))
@@ -602,7 +733,7 @@ async function handleSMSProviderChange(provider: SMSProvider): Promise<void> {
   form.priceKey = ''
   connectionError.value = ''
 
-  const draft = persistBatchFormDraft()
+  const draft = currentBatchFormDraft()
   await loadSettings(provider)
   if (disposed || provider !== smsProvider.value) return
   if (settingsByProvider[provider].configured) {
@@ -630,8 +761,6 @@ async function restoreBatchFormCatalog(draft: ClientBatchForm): Promise<void> {
   if (!settingsByProvider[provider].configured || draft.smsProvider !== provider) return
   const restoreVersion = ++catalogRestoreVersion
   catalogActionVersion += 1
-  restoringBatchForm = true
-  restoringCatalogDraft = draft
   catalogReady.value = false
   countryRequestVersion += 1
   priceRequestVersion += 1
@@ -765,7 +894,6 @@ async function startBatch(): Promise<void> {
     currentBatch.value = batch
     currentBatchId.value = batch.id
     activations.value = []
-    safeSetItem(localStorageAccess, ACTIVE_BATCH_KEY, batch.id)
     connectionError.value = ''
     ElMessage.success('任务已启动')
     startPolling()
@@ -804,7 +932,6 @@ async function refreshDashboard(silent = true): Promise<void> {
       currentBatchId.value = ''
       currentBatch.value = null
       activations.value = []
-      safeRemoveItem(localStorageAccess, ACTIVE_BATCH_KEY)
       return
     }
     connectionError.value = friendlyError(error)
@@ -843,7 +970,6 @@ async function stopCurrentBatch(): Promise<void> {
     currentBatch.value = stoppedBatch
     currentBatchId.value = stoppedBatch.id
     activations.value = []
-    safeSetItem(localStorageAccess, ACTIVE_BATCH_KEY, stoppedBatch.id)
     connectionError.value = ''
     ElMessage.success('停止请求已提交，未完成号码正在取消')
     await refreshDashboard(true)
@@ -947,10 +1073,24 @@ async function deleteActivation(activation: ActivationView): Promise<void> {
 onMounted(async () => {
   disposed = false
   startClock()
+  window.addEventListener('online', handleBrowserOnline)
+  window.addEventListener('pagehide', flushBatchDraftOnPageHide)
+  if (!legacyClientPersistenceCleared) {
+    legacyClientPersistenceCleared = clearLegacyClientPersistence()
+    if (!legacyClientPersistenceCleared) {
+      ElMessage.warning('浏览器中的旧版明文缓存清理失败；请允许站点存储访问后刷新页面重试')
+    }
+  }
+
+  const persistedBatchDraft = await loadBatchFormDraft()
+  if (disposed) return
+  if (persistedBatchDraft) activateBatchDraftPersistence(persistedBatchDraft)
+  const startupBatchDraft = persistedBatchDraft ?? currentBatchFormDraft()
+
   startLoginStatusPolling()
   await Promise.all([
     loadSettings(),
-    restoreActiveBatchFromServer(),
+    restoreLatestBatchFromServer(),
     refreshAccountLoginStatuses(),
   ])
   if (disposed) return
@@ -958,19 +1098,29 @@ onMounted(async () => {
   if (disposed) return
   activeBatchLoading.value = false
   if (settingsReady.value) {
-    await restoreBatchFormCatalog(persistedBatchForm)
+    await restoreBatchFormCatalog(startupBatchDraft)
   } else {
     cancelBatchFormCatalogRestore()
     catalogReady.value = false
-    persistBatchFormDraft()
   }
   if (disposed) return
+  if (!persistedBatchDraft) scheduleBatchDraftLoadRetry()
   startPolling()
 })
 
 onBeforeUnmount(() => {
-  disposed = true
   activeBatchLoading.value = false
+  if (batchDraftSaveTimer !== undefined) window.clearTimeout(batchDraftSaveTimer)
+  batchDraftSaveTimer = undefined
+  if (batchDraftSaveRetryTimer !== undefined) window.clearTimeout(batchDraftSaveRetryTimer)
+  batchDraftSaveRetryTimer = undefined
+  if (batchDraftLoadRetryTimer !== undefined) window.clearTimeout(batchDraftLoadRetryTimer)
+  batchDraftLoadRetryTimer = undefined
+  if (batchDraftPersistenceReady) void enqueueBatchDraftSave(currentBatchFormDraft(), true)
+  batchDraftPersistenceReady = false
+  disposed = true
+  window.removeEventListener('online', handleBrowserOnline)
+  window.removeEventListener('pagehide', flushBatchDraftOnPageHide)
   loginStatusAbortController?.abort()
   loginStatusAbortController = undefined
   loginStatusRefreshing.value = false
@@ -999,8 +1149,9 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="topbar__state">
+        <a class="hero-sms-entry" href="/hero-sms" @click.prevent="openHeroSmsPage">HeroSMS 独立购号</a>
         <span class="live-dot" />
-        {{ connectionError ? '连接异常' : '服务运行中' }}
+        {{ visibleConnectionError ? '连接异常' : '服务运行中' }}
       </div>
     </header>
 
@@ -1021,9 +1172,9 @@ onBeforeUnmount(() => {
       </section>
 
       <el-alert
-        v-if="connectionError"
+        v-if="visibleConnectionError"
         class="connection-alert"
-        :title="connectionError"
+        :title="visibleConnectionError"
         type="error"
         show-icon
         :closable="false"
@@ -1063,7 +1214,7 @@ onBeforeUnmount(() => {
                 <span class="step-index">01</span>
                 <div>
                   <h2>{{ currentSMSProviderProfile.displayName }} 配置</h2>
-                  <p>凭据同步保存到服务端，并在此客户端保留输入</p>
+                  <p>凭据加密保存到服务端数据库，浏览器不保留明文</p>
                 </div>
               </div>
               <el-tag v-if="settingsReady" type="success" effect="plain" round>已配置</el-tag>

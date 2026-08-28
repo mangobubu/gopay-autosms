@@ -25,6 +25,7 @@ type Config struct {
 // configured not to probe getPricesV3/getPricesV2 first.
 type Client struct {
 	*smsbower.Client
+	transport *heroTransport
 }
 
 var _ smsbower.API = (*Client)(nil)
@@ -34,16 +35,20 @@ func NewClient(cfg Config) (*Client, error) {
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
+	transport, err := newHeroTransport(baseURL, cfg.APIKey, cfg.HTTPClient)
+	if err != nil {
+		return nil, err
+	}
 	client, err := smsbower.NewClient(smsbower.Config{
 		APIKey:       cfg.APIKey,
 		BaseURL:      baseURL,
-		HTTPClient:   cfg.HTTPClient,
+		HTTPClient:   transport.http,
 		PriceActions: []string{"getPrices"},
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &Client{Client: client}, nil
+	return &Client{Client: client, transport: transport}, nil
 }
 
 // GetPrices deliberately removes SMSBower-specific provider metadata.

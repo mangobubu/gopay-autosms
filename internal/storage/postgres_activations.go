@@ -17,7 +17,7 @@ const activationColumns = `id, batch_id, account_id, provider, provider_activati
 	purchase_price_amount, currency, status, status_changed_at, failure_reason, balance_rp,
 	balance_checked_at, ever_fulfilled, slot_reserved, sms_cycle, next_run_at, lease_owner,
 	lease_until, lease_version, control_action, provider_payload, provider_expires_at,
-	last_polled_at, hidden_at, created_at, updated_at, finished_at`
+	last_polled_at, hidden_at, created_at, updated_at, finished_at, sensitive_enc`
 
 const providerActivationLockSQL = `SELECT pg_advisory_xact_lock(hashtextextended($1, 1))`
 
@@ -85,31 +85,44 @@ func lockProviderActivation(ctx context.Context, tx pgx.Tx, provider, providerID
 	return nil
 }
 
-func scanActivation(row rowScanner) (domain.Activation, error) {
+func (s *PostgresStore) scanActivation(row rowScanner) (domain.Activation, error) {
 	var activation domain.Activation
 	var accountID sql.NullInt64
 	var balance sql.NullFloat64
 	var balanceCheckedAt, leaseUntil, providerExpiresAt sql.NullTime
 	var lastPolledAt, hiddenAt, finishedAt sql.NullTime
 	var status, controlAction string
-	var providerPayload []byte
+	var legacyPhone string
+	var providerPayload, sensitive []byte
 	err := row.Scan(
 		&activation.ID, &activation.BatchID, &accountID, &activation.Provider,
-		&activation.ProviderActivationID, &activation.PhoneNumber, &activation.PhoneFingerprint,
+		&activation.ProviderActivationID, &legacyPhone, &activation.PhoneFingerprint,
 		&activation.ServiceCode, &activation.CountryCode, &activation.Operator,
 		&activation.PurchasePriceAmount, &activation.Currency, &status, &activation.StatusChangedAt,
 		&activation.FailureReason, &balance, &balanceCheckedAt, &activation.EverFulfilled,
 		&activation.SlotReserved, &activation.SMSCycle, &activation.NextRunAt, &activation.LeaseOwner, &leaseUntil,
 		&activation.LeaseVersion,
 		&controlAction, &providerPayload, &providerExpiresAt, &lastPolledAt, &hiddenAt,
-		&activation.CreatedAt, &activation.UpdatedAt, &finishedAt,
+		&activation.CreatedAt, &activation.UpdatedAt, &finishedAt, &sensitive,
 	)
 	if err != nil {
 		return domain.Activation{}, err
 	}
 	activation.Status = domain.ActivationStatus(status)
 	activation.ControlAction = domain.ControlAction(controlAction)
+	activation.PhoneNumber = legacyPhone
 	activation.ProviderPayload = cloneJSON(providerPayload)
+	if len(sensitive) > 0 {
+		envelope, openErr := openActivationSensitive(
+			s.protector, sensitive, activation.Provider, activation.ProviderActivationID,
+			activation.PhoneFingerprint,
+		)
+		if openErr != nil {
+			return domain.Activation{}, fmt.Errorf("decrypt activation %d: %w", activation.ID, openErr)
+		}
+		activation.PhoneNumber = envelope.PhoneNumber
+		activation.ProviderPayload = cloneJSON(envelope.ProviderPayload)
+	}
 	if accountID.Valid {
 		activation.AccountID = &accountID.Int64
 	}
@@ -158,8 +171,17 @@ func (s *PostgresStore) CreateActivationAtomically(
 	if params.NextRunAt.IsZero() {
 		params.NextRunAt = time.Now().UTC()
 	}
-	fingerprint := domain.PhoneFingerprint(normalized)
+	fingerprint, err := activationPhoneBlindIndex(s.protector, normalized)
+	if err != nil {
+		return CreateActivationResult{}, err
+	}
 	payload := validJSONOrObject(params.ProviderPayload)
+	sensitive, err := sealActivationSensitive(
+		s.protector, params.Provider, params.ProviderActivationID, fingerprint, normalized, payload,
+	)
+	if err != nil {
+		return CreateActivationResult{}, err
+	}
 
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -194,14 +216,13 @@ func (s *PostgresStore) CreateActivationAtomically(
 		if !committedActivationID.Valid {
 			return CreateActivationResult{}, ErrConflict
 		}
-		existing, scanErr := scanActivation(tx.QueryRow(ctx,
+		existing, scanErr := s.scanActivation(tx.QueryRow(ctx,
 			`SELECT `+activationColumns+` FROM activations WHERE id=$1`, committedActivationID.Int64,
 		))
 		if scanErr != nil {
 			return CreateActivationResult{}, mapError(scanErr)
 		}
-		expectedFingerprint := domain.PhoneFingerprint(normalized)
-		if existing.BatchID != params.BatchID || existing.PhoneFingerprint != expectedFingerprint ||
+		if existing.BatchID != params.BatchID || existing.PhoneFingerprint != fingerprint ||
 			existing.ServiceCode != params.ServiceCode || existing.CountryCode != params.CountryCode ||
 			existing.Provider != params.Provider || existing.ProviderActivationID != params.ProviderActivationID {
 			return CreateActivationResult{}, ErrConflict
@@ -222,7 +243,7 @@ func (s *PostgresStore) CreateActivationAtomically(
 	}
 	// A provider activation can only be consumed by the token that first
 	// commits it. A different reserved token is left unresolved for audit.
-	if _, scanErr := scanActivation(tx.QueryRow(ctx,
+	if _, scanErr := s.scanActivation(tx.QueryRow(ctx,
 		`SELECT `+activationColumns+` FROM activations WHERE provider=$1 AND provider_activation_id=$2`,
 		params.Provider, params.ProviderActivationID,
 	)); scanErr == nil {
@@ -254,21 +275,37 @@ func (s *PostgresStore) CreateActivationAtomically(
 		batch_id, provider, provider_activation_id, phone_number, phone_fingerprint,
 		service_code, country_code, operator, purchase_price_amount, currency,
 		status, failure_reason, slot_reserved, provider_payload, provider_expires_at, next_run_at,
-		control_action, hidden_at
-	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,true,$13::jsonb,$14,$15,$16,$17)
+		control_action, hidden_at, sensitive_enc
+	) VALUES($1,$2,$3,'',$4,$5,$6,$7,$8,$9,$10,$11,true,'{}'::jsonb,$12,$13,$14,$15,$16)
 	ON CONFLICT(provider, provider_activation_id) DO NOTHING
 	RETURNING ` + activationColumns
-	activation, err := scanActivation(tx.QueryRow(ctx, insertQuery,
-		params.BatchID, params.Provider, params.ProviderActivationID, normalized, fingerprint,
+	activation, err := s.scanActivation(tx.QueryRow(ctx, insertQuery,
+		params.BatchID, params.Provider, params.ProviderActivationID, fingerprint,
 		params.ServiceCode, params.CountryCode, params.Operator, params.PurchasePriceAmount,
-		params.Currency, string(activationStatus), failureReason, payload, params.ProviderExpiresAt,
-		params.NextRunAt, controlAction, hiddenAt,
+		params.Currency, string(activationStatus), failureReason, params.ProviderExpiresAt,
+		params.NextRunAt, controlAction, hiddenAt, sensitive,
 	))
 	if err == pgx.ErrNoRows {
 		return CreateActivationResult{}, ErrConflict
 	}
 	if err != nil {
 		return CreateActivationResult{}, mapError(err)
+	}
+	if params.Provider == heroSMSProvider {
+		linked, linkErr := tx.Exec(ctx, `UPDATE hero_sms_webhook_events SET activation_id=$1
+			WHERE activation_id IS NULL AND provider_activation_id=$2`,
+			activation.ID, params.ProviderActivationID,
+		)
+		if linkErr != nil {
+			return CreateActivationResult{}, mapError(linkErr)
+		}
+		if linked.RowsAffected() > 0 {
+			// This activation has no lease yet, so the shared wake statement can
+			// safely move its first run forward without setting a wake marker.
+			if _, linkErr = tx.Exec(ctx, wakeHeroSMSActivationSQL, activation.ID, time.Now().UTC()); linkErr != nil {
+				return CreateActivationResult{}, mapError(linkErr)
+			}
+		}
 	}
 
 	attemptResult, err := tx.Exec(ctx, `UPDATE batch_purchase_attempts SET
@@ -296,7 +333,7 @@ func (s *PostgresStore) CreateActivationAtomically(
 }
 
 func (s *PostgresStore) GetActivation(ctx context.Context, id int64) (domain.Activation, error) {
-	activation, err := scanActivation(s.pool.QueryRow(ctx,
+	activation, err := s.scanActivation(s.pool.QueryRow(ctx,
 		`SELECT `+activationColumns+` FROM activations WHERE id=$1`, id))
 	if err != nil {
 		return domain.Activation{}, mapError(err)
@@ -305,7 +342,7 @@ func (s *PostgresStore) GetActivation(ctx context.Context, id int64) (domain.Act
 }
 
 func (s *PostgresStore) GetActivationByProviderID(ctx context.Context, provider, providerID string) (domain.Activation, error) {
-	activation, err := scanActivation(s.pool.QueryRow(ctx,
+	activation, err := s.scanActivation(s.pool.QueryRow(ctx,
 		`SELECT `+activationColumns+` FROM activations WHERE provider=$1 AND provider_activation_id=$2`,
 		provider, providerID,
 	))
@@ -316,7 +353,18 @@ func (s *PostgresStore) GetActivationByProviderID(ctx context.Context, provider,
 }
 
 func (s *PostgresStore) ListActivations(ctx context.Context, filter ActivationFilter) ([]domain.Activation, error) {
-	query, args := buildActivationListQuery(filter)
+	phoneFingerprint := ""
+	if phone := strings.TrimSpace(filter.PhoneExact); phone != "" {
+		normalized, err := domain.NormalizePhone(phone)
+		if err != nil {
+			return nil, ErrInvalidInput
+		}
+		phoneFingerprint, err = activationPhoneBlindIndex(s.protector, normalized)
+		if err != nil {
+			return nil, err
+		}
+	}
+	query, args := buildActivationListQuery(filter, phoneFingerprint)
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list activations: %w", err)
@@ -324,7 +372,7 @@ func (s *PostgresStore) ListActivations(ctx context.Context, filter ActivationFi
 	defer rows.Close()
 	activations := make([]domain.Activation, 0)
 	for rows.Next() {
-		activation, scanErr := scanActivation(rows)
+		activation, scanErr := s.scanActivation(rows)
 		if scanErr != nil {
 			return nil, fmt.Errorf("scan activation: %w", scanErr)
 		}
@@ -336,7 +384,7 @@ func (s *PostgresStore) ListActivations(ctx context.Context, filter ActivationFi
 	return activations, nil
 }
 
-func buildActivationListQuery(filter ActivationFilter) (string, []any) {
+func buildActivationListQuery(filter ActivationFilter, phoneFingerprint string) (string, []any) {
 	page := normalizePage(filter.Page)
 	query := `SELECT ` + activationColumns + ` FROM activations`
 	conditions := make([]string, 0, 4)
@@ -358,8 +406,8 @@ func buildActivationListQuery(filter ActivationFilter) (string, []any) {
 	if !filter.IncludeHidden {
 		conditions = append(conditions, `hidden_at IS NULL`)
 	}
-	if phone := strings.TrimSpace(filter.PhoneContains); phone != "" {
-		conditions = append(conditions, `phone_number ILIKE `+addArg(`%`+phone+`%`))
+	if phoneFingerprint != "" {
+		conditions = append(conditions, `phone_fingerprint=`+addArg(phoneFingerprint))
 	}
 	if len(conditions) > 0 {
 		query += ` WHERE ` + strings.Join(conditions, ` AND `)
@@ -385,7 +433,7 @@ func (s *PostgresStore) ListRecoverableActivations(ctx context.Context, limit in
 	defer rows.Close()
 	result := make([]domain.Activation, 0)
 	for rows.Next() {
-		activation, scanErr := scanActivation(rows)
+		activation, scanErr := s.scanActivation(rows)
 		if scanErr != nil {
 			return nil, fmt.Errorf("scan recoverable activation: %w", scanErr)
 		}
@@ -396,6 +444,12 @@ func (s *PostgresStore) ListRecoverableActivations(ctx context.Context, limit in
 	}
 	return result, nil
 }
+
+const runnableActivationDueSQL = `(next_run_at <= $2 OR webhook_wakeup_at <= $2
+	OR EXISTS (SELECT 1 FROM hero_sms_webhook_events webhook_event
+		WHERE webhook_event.activation_id=activations.id AND webhook_event.status='processing'))`
+
+const runnableActivationOrderSQL = `LEAST(next_run_at,COALESCE(webhook_wakeup_at,next_run_at))`
 
 func (s *PostgresStore) ClaimRunnableActivations(
 	ctx context.Context,
@@ -415,9 +469,10 @@ func (s *PostgresStore) ClaimRunnableActivations(
 	query := `WITH candidates AS (
 		SELECT id FROM activations
 		WHERE finished_at IS NULL
-			AND next_run_at <= $2
+			AND ` + runnableActivationDueSQL + `
 			AND (lease_until IS NULL OR lease_until <= $2)
-		ORDER BY CASE WHEN control_action <> '' THEN 0 ELSE 1 END, next_run_at, id
+		ORDER BY CASE WHEN control_action <> '' THEN 0 ELSE 1 END,
+			` + runnableActivationOrderSQL + `, id
 		FOR UPDATE SKIP LOCKED
 		LIMIT $4
 	)
@@ -432,7 +487,7 @@ func (s *PostgresStore) ClaimRunnableActivations(
 	defer rows.Close()
 	result := make([]domain.Activation, 0)
 	for rows.Next() {
-		activation, scanErr := scanActivation(rows)
+		activation, scanErr := s.scanActivation(rows)
 		if scanErr != nil {
 			return nil, fmt.Errorf("scan claimed activation: %w", scanErr)
 		}
@@ -452,10 +507,14 @@ func prefixedActivationColumns(prefix string) string {
 	return strings.Join(parts, ", ")
 }
 
+const releaseActivationLeaseSQL = `UPDATE activations SET
+	lease_owner='', lease_until=NULL,
+	next_run_at=LEAST($3,COALESCE(webhook_wakeup_at,$3)),
+	webhook_wakeup_at=NULL, updated_at=now()
+	WHERE id=$1 AND lease_owner=$2`
+
 func (s *PostgresStore) ReleaseActivationLease(ctx context.Context, id int64, owner string, nextRunAt time.Time) error {
-	result, err := s.pool.Exec(ctx, `UPDATE activations SET
-		lease_owner='', lease_until=NULL, next_run_at=$3, updated_at=now()
-		WHERE id=$1 AND lease_owner=$2`, id, owner, nextRunAt)
+	result, err := s.pool.Exec(ctx, releaseActivationLeaseSQL, id, owner, nextRunAt)
 	if err != nil {
 		return mapError(err)
 	}
@@ -539,7 +598,7 @@ func (s *PostgresStore) transitionActivation(
 		selectArgs = append(selectArgs, owner, leaseVersion)
 	}
 	selectQuery += ` FOR UPDATE`
-	current, err := scanActivation(tx.QueryRow(ctx, selectQuery, selectArgs...))
+	current, err := s.scanActivation(tx.QueryRow(ctx, selectQuery, selectArgs...))
 	if err != nil {
 		return domain.Activation{}, mapError(err)
 	}
@@ -576,9 +635,14 @@ func (s *PostgresStore) transitionActivation(
 		updateArgs = append(updateArgs, owner, leaseVersion)
 	}
 	query += ` RETURNING ` + activationColumns
-	updated, err := scanActivation(tx.QueryRow(ctx, query, updateArgs...))
+	updated, err := s.scanActivation(tx.QueryRow(ctx, query, updateArgs...))
 	if err != nil {
 		return domain.Activation{}, mapError(err)
+	}
+	if terminal {
+		if err = ignoreOpenHeroSMSWebhookEvents(ctx, tx, id); err != nil {
+			return domain.Activation{}, err
+		}
 	}
 	if terminal && current.SlotReserved {
 		if err = releaseBatchSlot(ctx, tx, current.BatchID, false); err != nil {
@@ -634,7 +698,7 @@ func (s *PostgresStore) finalizeActivation(
 		selectArgs = append(selectArgs, owner, leaseVersion)
 	}
 	selectQuery += ` FOR UPDATE`
-	current, err := scanActivation(tx.QueryRow(ctx, selectQuery, selectArgs...))
+	current, err := s.scanActivation(tx.QueryRow(ctx, selectQuery, selectArgs...))
 	if err != nil {
 		return domain.Activation{}, mapError(err)
 	}
@@ -662,9 +726,12 @@ func (s *PostgresStore) finalizeActivation(
 		updateArgs = append(updateArgs, owner, leaseVersion)
 	}
 	updateQuery += ` RETURNING ` + activationColumns
-	updated, err := scanActivation(tx.QueryRow(ctx, updateQuery, updateArgs...))
+	updated, err := s.scanActivation(tx.QueryRow(ctx, updateQuery, updateArgs...))
 	if err != nil {
 		return domain.Activation{}, mapError(err)
+	}
+	if err = ignoreOpenHeroSMSWebhookEvents(ctx, tx, id); err != nil {
+		return domain.Activation{}, err
 	}
 	if current.SlotReserved {
 		if err = releaseBatchSlot(ctx, tx, current.BatchID, false); err != nil {

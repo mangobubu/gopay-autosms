@@ -3,6 +3,9 @@ import { fileURLToPath, URL } from 'node:url'
 import vue from '@vitejs/plugin-vue'
 import { defineConfig } from 'vite'
 
+const apiProxyTarget = 'http://127.0.0.1:8080'
+const apiPublicOrigin = 'http://localhost:8080'
+
 export default defineConfig({
   plugins: [vue()],
   resolve: {
@@ -17,8 +20,19 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8080',
+        target: apiProxyTarget,
         changeOrigin: true,
+        configure(proxy) {
+          proxy.on('proxyReq', (proxyRequest, request) => {
+            // Vite serves the browser from :5173, while the backend validates
+            // unsafe requests against its configured :8080 public origin.
+            // Rewrite only the forwarded request; production CSRF checks stay
+            // strict and the browser never talks cross-origin to the API.
+            if (request.headers.origin) {
+              proxyRequest.setHeader('origin', apiPublicOrigin)
+            }
+          })
+        },
       },
     },
   },

@@ -1,0 +1,29 @@
+services:
+  autosms:
+    environment:
+      AUTOSMS_PUBLIC_URL: "https://${AUTOSMS_DOMAIN:?请设置 AUTOSMS_DOMAIN}"
+      AUTOSMS_AUTH_USERNAME: "${AUTOSMS_AUTH_USERNAME:-admin}"
+      AUTOSMS_AUTH_PASSWORD: "${AUTOSMS_AUTH_PASSWORD:?请设置 AUTOSMS_AUTH_PASSWORD}"
+      AUTOSMS_HEROSMS_WEBHOOK_TOKEN: "${AUTOSMS_HEROSMS_WEBHOOK_TOKEN:?请设置 AUTOSMS_HEROSMS_WEBHOOK_TOKEN}"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: autosms-caddy
+    environment:
+      AUTOSMS_DOMAIN: "${AUTOSMS_DOMAIN:?请设置 AUTOSMS_DOMAIN}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      autosms:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  caddy-data:
+  caddy-config:

@@ -1,4 +1,5 @@
 import type { BatchRequest, SMSProvider, SMSProviderSettings } from './types'
+import type { ClientBatchForm } from './persistence'
 
 export class ApiError extends Error {
   readonly status: number
@@ -158,6 +159,26 @@ export const api = {
       api_key: settings.apiKey,
     }),
   }),
+
+  getBatchDraft: () => request<unknown>('/api/settings/batch-draft', {
+    cache: 'no-store',
+  }),
+
+  saveBatchDraft: (draft: ClientBatchForm, keepalive = false) =>
+    request<unknown>('/api/settings/batch-draft', {
+      method: 'PUT',
+      keepalive,
+      body: JSON.stringify({
+        sms_provider: draft.smsProvider,
+        service: draft.service,
+        country: draft.country,
+        price_key: draft.priceKey,
+        quantity: draft.quantity,
+        pin: draft.pin,
+        proxy: draft.proxy,
+        price_snapshot: draft.priceSnapshot ?? null,
+      }),
+    }),
 
   getServices: (smsProvider: SMSProvider = 'smsbower') =>
     request<unknown>(withQuery('/api/catalog/services', { sms_provider: smsProvider })),

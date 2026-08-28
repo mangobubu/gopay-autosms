@@ -12,27 +12,39 @@ import (
 )
 
 const verificationColumns = `id, activation_id, cycle_no, phase, ordinal, code,
-	provider_payload, provider_received_at, created_at`
+	provider_payload, provider_received_at, created_at, sensitive_enc`
 
 const ownedVerificationLeaseSQL = `SELECT id FROM activations
 	WHERE id=$1 AND lease_owner=$2 AND lease_version=$3 AND finished_at IS NULL
 	FOR UPDATE`
 
-func scanVerification(row rowScanner) (domain.VerificationCode, error) {
+func (s *PostgresStore) scanVerification(row rowScanner) (domain.VerificationCode, error) {
 	var verification domain.VerificationCode
 	var phase string
-	var payload []byte
+	var legacyCode string
+	var payload, sensitive []byte
 	var providerReceivedAt sql.NullTime
 	err := row.Scan(
 		&verification.ID, &verification.ActivationID, &verification.CycleNo,
-		&phase, &verification.Ordinal, &verification.Code, &payload,
-		&providerReceivedAt, &verification.CreatedAt,
+		&phase, &verification.Ordinal, &legacyCode, &payload,
+		&providerReceivedAt, &verification.CreatedAt, &sensitive,
 	)
 	if err != nil {
 		return domain.VerificationCode{}, err
 	}
 	verification.Phase = domain.VerificationPhase(phase)
+	verification.Code = legacyCode
 	verification.ProviderPayload = cloneJSON(payload)
+	if len(sensitive) > 0 {
+		envelope, openErr := openVerificationSensitive(
+			s.protector, sensitive, verification.ActivationID, verification.CycleNo,
+		)
+		if openErr != nil {
+			return domain.VerificationCode{}, fmt.Errorf("decrypt verification %d: %w", verification.ID, openErr)
+		}
+		verification.Code = envelope.Code
+		verification.ProviderPayload = cloneJSON(envelope.ProviderPayload)
+	}
 	if providerReceivedAt.Valid {
 		verification.ProviderReceivedAt = &providerReceivedAt.Time
 	}
@@ -71,6 +83,12 @@ func (s *PostgresStore) appendVerificationCode(
 		return AppendVerificationResult{}, ErrInvalidInput
 	}
 	payload := validJSONOrObject(params.ProviderPayload)
+	sensitive, err := sealVerificationSensitive(
+		s.protector, params.ActivationID, params.CycleNo, params.Code, payload,
+	)
+	if err != nil {
+		return AppendVerificationResult{}, err
+	}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return AppendVerificationResult{}, fmt.Errorf("begin append verification: %w", err)
@@ -98,15 +116,15 @@ func (s *PostgresStore) appendVerificationCode(
 	// Ordinal is an append-only sequence across the activation. Login and PIN
 	// remain separately labelled, while subsequent messages render as 1, 2, 3…
 	query := `INSERT INTO verification_codes(
-		activation_id, cycle_no, phase, ordinal, code, provider_payload, provider_received_at
+		activation_id, cycle_no, phase, ordinal, code, provider_payload, provider_received_at, sensitive_enc
 	) SELECT $1,$2,$3,
 		CASE WHEN $3='subsequent' THEN COALESCE((SELECT max(ordinal)+1 FROM verification_codes WHERE activation_id=$1 AND phase='subsequent'),1) ELSE 0 END,
-		$4,$5::jsonb,$6
+		'','{}'::jsonb,$4,$5
 	ON CONFLICT(activation_id, cycle_no) DO NOTHING
 	RETURNING ` + verificationColumns
-	verification, err := scanVerification(tx.QueryRow(ctx, query,
-		params.ActivationID, params.CycleNo, string(params.Phase), params.Code,
-		payload, params.ProviderReceivedAt,
+	verification, err := s.scanVerification(tx.QueryRow(ctx, query,
+		params.ActivationID, params.CycleNo, string(params.Phase),
+		params.ProviderReceivedAt, sensitive,
 	))
 	if err == nil {
 		if err = tx.Commit(ctx); err != nil {
@@ -117,7 +135,7 @@ func (s *PostgresStore) appendVerificationCode(
 	if err != pgx.ErrNoRows {
 		return AppendVerificationResult{}, mapError(err)
 	}
-	verification, err = scanVerification(tx.QueryRow(ctx,
+	verification, err = s.scanVerification(tx.QueryRow(ctx,
 		`SELECT `+verificationColumns+` FROM verification_codes WHERE activation_id=$1 AND cycle_no=$2`,
 		params.ActivationID, params.CycleNo,
 	))
@@ -140,7 +158,7 @@ func (s *PostgresStore) ListVerificationCodes(ctx context.Context, activationID 
 	defer rows.Close()
 	result := make([]domain.VerificationCode, 0)
 	for rows.Next() {
-		verification, scanErr := scanVerification(rows)
+		verification, scanErr := s.scanVerification(rows)
 		if scanErr != nil {
 			return nil, fmt.Errorf("scan verification code: %w", scanErr)
 		}

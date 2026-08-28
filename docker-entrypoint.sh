@@ -68,6 +68,13 @@ if [[ -s "${db_env_file}" ]]; then
   persisted_db_admin_user="${persisted_db_admin_user:-${persisted_db_user}}"
 fi
 
+if [[ -n "${persisted_secret_key}" &&
+      -n "${requested_secret_key}" &&
+      "${requested_secret_key}" != "${persisted_secret_key}" ]]; then
+  echo "Startup aborted: AUTOSMS_SECRET_KEY does not match the key persisted in ${db_env_file}; the persisted encryption key was left unchanged." >&2
+  exit 1
+fi
+
 AUTOSMS_DB_USER="${requested_db_user:-${persisted_db_user:-autosms}}"
 AUTOSMS_DB_NAME="${requested_db_name:-${persisted_db_name:-autosms}}"
 AUTOSMS_DB_PASSWORD="${requested_db_password:-${persisted_db_password:-}}"
@@ -194,7 +201,6 @@ echo "DB host:     ${db_host}"
 echo "DB port:     ${db_port} (container internal only)"
 echo "DB name:     ${AUTOSMS_DB_NAME}"
 echo "DB user:     ${AUTOSMS_DB_USER}"
-echo "DB password: ${AUTOSMS_DB_PASSWORD}"
 echo "Web address: ${public_url}"
 echo "Credentials file: ${db_env_file}"
 echo "============================================================"

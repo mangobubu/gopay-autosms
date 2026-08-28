@@ -24,23 +24,43 @@ type Server struct {
 	store            storage.Store
 	settings         *appsettings.Manager
 	workflow         *workflow.Manager
+	heroSMS          *HeroSMSAPI
+	webhookReceiver  HeroSMSWebhookReceiver
+	webhookToken     string
 	smsClientFactory func(context.Context, string) (smsbower.API, error)
 }
 
 func NewRouter(store storage.Store, settings *appsettings.Manager, manager *workflow.Manager, spa http.Handler) *gin.Engine {
-	server := &Server{store: store, settings: settings, workflow: manager}
+	return NewRouterWithConfig(store, settings, manager, spa, RouterConfig{})
+}
+
+// NewRouterWithConfig applies the security settings used by an Internet-facing
+// deployment. NewRouter remains available for focused package tests and local
+// embedding that install authentication outside this package.
+func NewRouterWithConfig(store storage.Store, settings *appsettings.Manager, manager *workflow.Manager, spa http.Handler, cfg RouterConfig) *gin.Engine {
+	receiver := cfg.HeroSMSWebhookReceiver
+	if receiver == nil && manager != nil {
+		// Keep the router boundary mockable without coupling webhook tests to a
+		// concrete workflow manager.
+		receiver = manager
+	}
+	server := &Server{store: store, settings: settings, workflow: manager, webhookReceiver: receiver, webhookToken: cfg.HeroSMSWebhookToken}
+	if cfg.HeroSMSTasks != nil {
+		server.heroSMS = NewHeroSMSAPI(settings, cfg.HeroSMSTasks)
+	}
 	router := gin.New()
-	router.Use(gin.Logger(), gin.Recovery())
+	router.Use(accessLogger(), safeRecovery(), securityHeaders(), limitRequestBodies(), basicAuth(cfg), csrfProtection(cfg))
 	router.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 	router.GET("/readyz", func(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 		defer cancel()
 		if err := store.Ping(ctx); err != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not_ready", "error": err.Error()})
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not_ready"})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})
+	router.POST(heroSMSWebhookRoute, server.receiveHeroSMSWebhook)
 
 	server.register(router.Group("/api"))
 	server.register(router.Group("/api/v1"))
@@ -51,12 +71,17 @@ func NewRouter(store storage.Store, settings *appsettings.Manager, manager *work
 }
 
 func (s *Server) register(group *gin.RouterGroup) {
+	if s.heroSMS != nil {
+		s.heroSMS.RegisterHeroSMSRoutes(group)
+	}
 	group.GET("/settings/smsbower", s.getSMSBowerSettings)
 	group.PUT("/settings/smsbower", s.putSMSBowerSettings)
 	group.POST("/settings/smsbower/test", s.testSMSBowerSettings)
 	group.GET("/settings/hero-sms", s.getHeroSMSSettings)
 	group.PUT("/settings/hero-sms", s.putHeroSMSSettings)
 	group.POST("/settings/hero-sms/test", s.testHeroSMSSettings)
+	group.GET("/settings/batch-draft", s.getBatchDraft)
+	group.PUT("/settings/batch-draft", s.putBatchDraft)
 	group.GET("/catalog/services", s.listServices)
 	group.GET("/catalog/countries", s.listCountries)
 	group.GET("/catalog/prices", s.listPrices)

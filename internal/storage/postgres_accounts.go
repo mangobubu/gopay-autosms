@@ -12,23 +12,32 @@ import (
 
 const accountColumns = `id, phone_number, phone_fingerprint, status, balance_rp,
 	credentials_enc, target_pin_enc, token_state, device_state, metadata,
-	last_login_at, created_at, updated_at`
+	last_login_at, created_at, updated_at, sensitive_enc`
 
-func scanAccount(row rowScanner) (domain.Account, error) {
+func (s *PostgresStore) scanAccount(row rowScanner) (domain.Account, error) {
 	var account domain.Account
 	var status string
 	var balance sql.NullFloat64
 	var lastLoginAt sql.NullTime
-	var tokenState, deviceState, metadata []byte
+	var legacyPhone string
+	var tokenState, deviceState, metadata, sensitive []byte
 	err := row.Scan(
-		&account.ID, &account.PhoneNumber, &account.PhoneFingerprint, &status, &balance,
+		&account.ID, &legacyPhone, &account.PhoneFingerprint, &status, &balance,
 		&account.CredentialsEnc, &account.TargetPINEnc, &tokenState, &deviceState, &metadata,
-		&lastLoginAt, &account.CreatedAt, &account.UpdatedAt,
+		&lastLoginAt, &account.CreatedAt, &account.UpdatedAt, &sensitive,
 	)
 	if err != nil {
 		return domain.Account{}, err
 	}
 	account.Status = domain.AccountStatus(status)
+	account.PhoneNumber = legacyPhone
+	if len(sensitive) > 0 {
+		envelope, openErr := openAccountSensitive(s.protector, sensitive, account.PhoneFingerprint)
+		if openErr != nil {
+			return domain.Account{}, fmt.Errorf("decrypt account %d: %w", account.ID, openErr)
+		}
+		account.PhoneNumber = envelope.PhoneNumber
+	}
 	if balance.Valid {
 		account.BalanceRP = &balance.Float64
 	}
@@ -52,13 +61,20 @@ func (s *PostgresStore) UpsertAccount(ctx context.Context, params UpsertAccountP
 	if !json.Valid(tokenState) || !json.Valid(deviceState) || !json.Valid(metadata) {
 		return domain.Account{}, fmt.Errorf("%w: malformed account JSON", ErrInvalidInput)
 	}
-	fingerprint := domain.PhoneFingerprint(normalized)
+	fingerprint, err := accountPhoneBlindIndex(s.protector, normalized)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	sensitive, err := sealAccountSensitive(s.protector, fingerprint, normalized)
+	if err != nil {
+		return domain.Account{}, err
+	}
 	query := `INSERT INTO accounts(
 		phone_number, phone_fingerprint, status, balance_rp, credentials_enc,
-		target_pin_enc, token_state, device_state, metadata, last_login_at
-	) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,$10)
+		target_pin_enc, token_state, device_state, metadata, last_login_at, sensitive_enc
+	) VALUES('',$1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,$9,$10)
 	ON CONFLICT(phone_fingerprint) DO UPDATE SET
-		phone_number=excluded.phone_number,
+		phone_number='',
 		status=excluded.status,
 		balance_rp=excluded.balance_rp,
 		credentials_enc=excluded.credentials_enc,
@@ -67,12 +83,13 @@ func (s *PostgresStore) UpsertAccount(ctx context.Context, params UpsertAccountP
 		device_state=excluded.device_state,
 		metadata=excluded.metadata,
 		last_login_at=excluded.last_login_at,
+		sensitive_enc=excluded.sensitive_enc,
 		updated_at=now()
 	RETURNING ` + accountColumns
-	account, err := scanAccount(s.pool.QueryRow(ctx, query,
-		normalized, fingerprint, string(params.Status), params.BalanceRP,
+	account, err := s.scanAccount(s.pool.QueryRow(ctx, query,
+		fingerprint, string(params.Status), params.BalanceRP,
 		params.CredentialsEnc, params.TargetPINEnc, tokenState, deviceState,
-		metadata, params.LastLoginAt,
+		metadata, params.LastLoginAt, sensitive,
 	))
 	if err != nil {
 		return domain.Account{}, mapError(err)
@@ -81,7 +98,7 @@ func (s *PostgresStore) UpsertAccount(ctx context.Context, params UpsertAccountP
 }
 
 func (s *PostgresStore) GetAccount(ctx context.Context, id int64) (domain.Account, error) {
-	account, err := scanAccount(s.pool.QueryRow(ctx, `SELECT `+accountColumns+` FROM accounts WHERE id=$1`, id))
+	account, err := s.scanAccount(s.pool.QueryRow(ctx, `SELECT `+accountColumns+` FROM accounts WHERE id=$1`, id))
 	if err != nil {
 		return domain.Account{}, mapError(err)
 	}
@@ -93,8 +110,11 @@ func (s *PostgresStore) GetAccountByPhone(ctx context.Context, phone string) (do
 	if err != nil {
 		return domain.Account{}, ErrInvalidInput
 	}
-	fingerprint := domain.PhoneFingerprint(normalized)
-	account, err := scanAccount(s.pool.QueryRow(ctx,
+	fingerprint, err := accountPhoneBlindIndex(s.protector, normalized)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	account, err := s.scanAccount(s.pool.QueryRow(ctx,
 		`SELECT `+accountColumns+` FROM accounts WHERE phone_fingerprint=$1`, fingerprint))
 	if err != nil {
 		return domain.Account{}, mapError(err)
@@ -111,7 +131,7 @@ func (s *PostgresStore) ListAccounts(ctx context.Context, filter AccountFilter) 
 	defer rows.Close()
 	accounts := make([]domain.Account, 0)
 	for rows.Next() {
-		account, scanErr := scanAccount(rows)
+		account, scanErr := s.scanAccount(rows)
 		if scanErr != nil {
 			return nil, fmt.Errorf("scan account: %w", scanErr)
 		}

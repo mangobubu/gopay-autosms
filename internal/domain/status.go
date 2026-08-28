@@ -1,8 +1,6 @@
 package domain
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"strings"
 	"unicode"
@@ -56,6 +54,16 @@ func (p VerificationPhase) Valid() bool {
 	return p == VerificationPhaseLogin || p == VerificationPhasePIN || p == VerificationPhaseSubsequent
 }
 
+func (s HeroSMSWebhookEventStatus) Valid() bool {
+	switch s {
+	case HeroSMSWebhookEventReceived, HeroSMSWebhookEventProcessing,
+		HeroSMSWebhookEventProcessed, HeroSMSWebhookEventIgnored:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s AccountStatus) Valid() bool {
 	switch s {
 	case AccountStatusPending, AccountStatusAuthenticated, AccountStatusPINPending, AccountStatusActive, AccountStatusDisabled, AccountStatusError:
@@ -96,14 +104,6 @@ func NormalizePhone(phone string) (string, error) {
 		normalized = "+" + normalized
 	}
 	return normalized, nil
-}
-
-// PhoneFingerprint provides a stable, non-clear-text lookup key for account
-// state and for preventing two unfinished activations from using the same
-// remote GoPay session at once. Finished numbers remain eligible for reuse.
-func PhoneFingerprint(normalizedPhone string) string {
-	sum := sha256.Sum256([]byte(normalizedPhone))
-	return hex.EncodeToString(sum[:])
 }
 
 func ValidatePIN(pin string) error {

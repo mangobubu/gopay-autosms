@@ -81,22 +81,22 @@ func newBatchLifecycleManager(store storage.Store) *Manager {
 	)
 }
 
-func TestCancelStartupBatchesCancelsEveryUnfinishedBatchOnly(t *testing.T) {
+func TestRecoverStartupBatchesPreservesAndRecoversEveryUnfinishedBatchOnce(t *testing.T) {
 	store := &batchLifecycleStore{batches: []domain.Batch{
 		{ID: 11, Status: domain.BatchStatusPending},
 		{ID: 12, Status: domain.BatchStatusRunning},
 		{ID: 13, Status: domain.BatchStatusCompleted},
 		{ID: 14, Status: domain.BatchStatusCancelled},
-		// A duplicated row must not result in a duplicated cancellation request.
+		// A duplicated row must not result in a duplicated recovery request.
 		{ID: 12, Status: domain.BatchStatusRunning},
 	}}
 	manager := newBatchLifecycleManager(store)
 
-	if err := manager.cancelStartupBatches(context.Background()); err != nil {
-		t.Fatalf("cancelStartupBatches() 返回错误：%v", err)
+	if err := manager.recoverStartupBatches(context.Background()); err != nil {
+		t.Fatalf("recoverStartupBatches() 返回错误：%v", err)
 	}
-	if want := []int64{11, 12}; !reflect.DeepEqual(store.cancelledIDs, want) {
-		t.Fatalf("取消批次 = %v，期望 %v", store.cancelledIDs, want)
+	if len(store.cancelledIDs) != 0 {
+		t.Fatalf("启动恢复不应取消批次，实际取消 = %v", store.cancelledIDs)
 	}
 	if want := []int64{11, 12}; !reflect.DeepEqual(store.recoveredIDs, want) {
 		t.Fatalf("恢复购买状态的批次 = %v，期望 %v", store.recoveredIDs, want)
@@ -115,45 +115,32 @@ func TestCancelStartupBatchesCancelsEveryUnfinishedBatchOnly(t *testing.T) {
 
 func TestRunDoesNotStartSchedulerWhenStartupCleanupFails(t *testing.T) {
 	listFailure := errors.New("list startup batches failed")
-	recoverFailure := errors.New("recover startup purchase failed")
-	cancelFailure := errors.New("cancel startup batch failed")
+	recoverFailureOne := errors.New("recover startup purchase one failed")
+	recoverFailureTwo := errors.New("recover startup purchase two failed")
 
 	for _, test := range []struct {
 		name          string
 		store         *batchLifecycleStore
-		want          error
+		wantErrors    []error
 		wantRecovered []int64
-		wantCancelled []int64
 	}{
 		{
 			name:          "读取遗留批次失败",
 			store:         &batchLifecycleStore{listErr: listFailure},
-			want:          listFailure,
+			wantErrors:    []error{listFailure},
 			wantRecovered: nil,
-			wantCancelled: nil,
 		},
 		{
-			name: "恢复遗留购号失败",
-			store: &batchLifecycleStore{
-				batches:    []domain.Batch{{ID: 20, Status: domain.BatchStatusRunning}},
-				recoverErr: map[int64]error{20: recoverFailure},
-			},
-			want:          recoverFailure,
-			wantRecovered: []int64{20},
-			wantCancelled: nil,
-		},
-		{
-			name: "取消遗留批次失败",
+			name: "汇总每个批次的遗留购号恢复错误",
 			store: &batchLifecycleStore{
 				batches: []domain.Batch{
-					{ID: 21, Status: domain.BatchStatusRunning},
-					{ID: 22, Status: domain.BatchStatusPending},
+					{ID: 20, Status: domain.BatchStatusRunning},
+					{ID: 21, Status: domain.BatchStatusPending},
 				},
-				cancelErr: map[int64]error{21: cancelFailure},
+				recoverErr: map[int64]error{20: recoverFailureOne, 21: recoverFailureTwo},
 			},
-			want:          cancelFailure,
-			wantRecovered: []int64{21, 22},
-			wantCancelled: []int64{21, 22},
+			wantErrors:    []error{recoverFailureOne, recoverFailureTwo},
+			wantRecovered: []int64{20, 21},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -162,11 +149,13 @@ func TestRunDoesNotStartSchedulerWhenStartupCleanupFails(t *testing.T) {
 			defer cancel()
 
 			err := manager.Run(ctx)
-			if !errors.Is(err, test.want) {
-				t.Fatalf("Run() 错误 = %v，期望包含 %v", err, test.want)
+			for _, wantErr := range test.wantErrors {
+				if !errors.Is(err, wantErr) {
+					t.Fatalf("Run() 错误 = %v，期望包含 %v", err, wantErr)
+				}
 			}
-			if !reflect.DeepEqual(test.store.cancelledIDs, test.wantCancelled) {
-				t.Fatalf("取消批次 = %v，期望 %v", test.store.cancelledIDs, test.wantCancelled)
+			if len(test.store.cancelledIDs) != 0 {
+				t.Fatalf("启动恢复不应取消批次，实际取消 = %v", test.store.cancelledIDs)
 			}
 			if !reflect.DeepEqual(test.store.recoveredIDs, test.wantRecovered) {
 				t.Fatalf("恢复购买状态的批次 = %v，期望 %v", test.store.recoveredIDs, test.wantRecovered)

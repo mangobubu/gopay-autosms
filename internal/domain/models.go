@@ -148,6 +148,40 @@ type VerificationCode struct {
 	CreatedAt          time.Time         `json:"created_at"`
 }
 
+// HeroSMSWebhookEvent is an append-only audit record for one HeroSMS callback.
+// ActivationID is nullable because HeroSMS may deliver the callback before the
+// provider purchase and its local activation have committed.
+type HeroSMSWebhookEvent struct {
+	ID                   int64                     `json:"id"`
+	ActivationID         *int64                    `json:"activation_id,omitempty"`
+	ProviderActivationID string                    `json:"provider_activation_id"`
+	Code                 *string                   `json:"code,omitempty"`
+	Text                 *string                   `json:"text,omitempty"`
+	PhoneNumber          string                    `json:"phone_number,omitempty"`
+	ServiceCode          string                    `json:"service_code,omitempty"`
+	CountryCode          string                    `json:"country_code,omitempty"`
+	ProviderReceivedAt   *time.Time                `json:"provider_received_at,omitempty"`
+	RawPayload           json.RawMessage           `json:"raw_payload"`
+	PayloadFingerprint   string                    `json:"payload_fingerprint"`
+	Status               HeroSMSWebhookEventStatus `json:"status"`
+	Attempts             int                       `json:"attempts"`
+	LastError            string                    `json:"last_error,omitempty"`
+	NextAttemptAt        time.Time                 `json:"next_attempt_at"`
+	ClaimedLeaseOwner    string                    `json:"claimed_lease_owner,omitempty"`
+	ClaimedLeaseVersion  int64                     `json:"claimed_lease_version,omitempty"`
+	ReceivedAt           time.Time                 `json:"received_at"`
+	ProcessedAt          *time.Time                `json:"processed_at,omitempty"`
+}
+
+type HeroSMSWebhookEventStatus string
+
+const (
+	HeroSMSWebhookEventReceived   HeroSMSWebhookEventStatus = "received"
+	HeroSMSWebhookEventProcessing HeroSMSWebhookEventStatus = "processing"
+	HeroSMSWebhookEventProcessed  HeroSMSWebhookEventStatus = "processed"
+	HeroSMSWebhookEventIgnored    HeroSMSWebhookEventStatus = "ignored"
+)
+
 type AccountStatus string
 
 const (

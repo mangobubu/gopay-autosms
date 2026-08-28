@@ -11,11 +11,11 @@ import (
 
 const startupBatchPageSize = 500
 
-// cancelStartupBatches runs synchronously before the scheduler starts. Listing
-// every batch before changing any status keeps offset pagination stable and
-// prevents a newly started scheduler tick from purchasing another number from
-// a historical batch while startup cleanup is still in progress.
-func (m *Manager) cancelStartupBatches(ctx context.Context) error {
+// recoverStartupBatches runs synchronously before the scheduler starts. It
+// preserves active batches so their durable activations can resume after a
+// restart, while fencing any provider purchase that the stopped process left
+// in an uncertain sent state.
+func (m *Manager) recoverStartupBatches(ctx context.Context) error {
 	batches := make([]domain.Batch, 0)
 	for offset := 0; ; {
 		page, err := m.store.ListBatches(ctx, storage.BatchFilter{
@@ -33,7 +33,7 @@ func (m *Manager) cancelStartupBatches(ctx context.Context) error {
 	}
 
 	seen := make(map[int64]struct{}, len(batches))
-	var cancelErrors []error
+	var recoveryErrors []error
 	for _, batch := range batches {
 		if batch.Status != domain.BatchStatusPending && batch.Status != domain.BatchStatusRunning {
 			continue
@@ -43,14 +43,10 @@ func (m *Manager) cancelStartupBatches(ctx context.Context) error {
 		}
 		seen[batch.ID] = struct{}{}
 		if err := m.recoverStartupPurchase(ctx, batch.ID); err != nil {
-			cancelErrors = append(cancelErrors, fmt.Errorf("recover unfinished purchase for batch %d during startup: %w", batch.ID, err))
-			continue
-		}
-		if _, err := m.cancelBatchPersistently(ctx, batch.ID); err != nil {
-			cancelErrors = append(cancelErrors, fmt.Errorf("cancel unfinished batch %d during startup: %w", batch.ID, err))
+			recoveryErrors = append(recoveryErrors, fmt.Errorf("recover unfinished purchase for batch %d during startup: %w", batch.ID, err))
 		}
 	}
-	return errors.Join(cancelErrors...)
+	return errors.Join(recoveryErrors...)
 }
 
 func (m *Manager) recoverStartupPurchase(ctx context.Context, batchID int64) error {

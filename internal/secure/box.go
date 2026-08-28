@@ -3,8 +3,10 @@ package secure
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 )
@@ -12,7 +14,8 @@ import (
 // Box provides authenticated encryption for persisted API/session secrets.
 // The container persists the source secret alongside the database credentials.
 type Box struct {
-	aead cipher.AEAD
+	aead          cipher.AEAD
+	blindIndexKey [sha256.Size]byte
 }
 
 func New(secret string) (*Box, error) {
@@ -28,7 +31,11 @@ func New(secret string) (*Box, error) {
 	if err != nil {
 		return nil, fmt.Errorf("secure: create GCM: %w", err)
 	}
-	return &Box{aead: aead}, nil
+	indexKey := hmac.New(sha256.New, key[:])
+	_, _ = indexKey.Write([]byte("autosms/postgres/blind-index-key/v1"))
+	box := &Box{aead: aead}
+	copy(box.blindIndexKey[:], indexKey.Sum(nil))
+	return box, nil
 }
 
 func (b *Box) Seal(plain []byte) ([]byte, error) {
@@ -55,4 +62,15 @@ func (b *Box) Open(ciphertext []byte) ([]byte, error) {
 		return nil, fmt.Errorf("secure: decrypt: %w", err)
 	}
 	return plain, nil
+}
+
+// BlindIndex returns a deterministic, purpose-separated lookup token without
+// exposing low-entropy plaintext to offline dictionary checks. It is separate
+// from Seal because database indexes must remain stable across process starts.
+func (b *Box) BlindIndex(purpose string, value []byte) string {
+	mac := hmac.New(sha256.New, b.blindIndexKey[:])
+	_, _ = mac.Write([]byte(purpose))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write(value)
+	return hex.EncodeToString(mac.Sum(nil))
 }

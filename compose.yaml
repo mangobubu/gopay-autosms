@@ -5,6 +5,9 @@ services:
     container_name: autosms
     environment:
       AUTOSMS_PUBLIC_URL: "http://localhost:${AUTOSMS_PORT:-8080}"
+      AUTOSMS_AUTH_USERNAME: "${AUTOSMS_AUTH_USERNAME:-admin}"
+      AUTOSMS_AUTH_PASSWORD: "${AUTOSMS_AUTH_PASSWORD:-autosms-local-password-change-me}"
+      AUTOSMS_HEROSMS_WEBHOOK_TOKEN: "${AUTOSMS_HEROSMS_WEBHOOK_TOKEN:-local_dev_only_webhook_token_0123456789abcdef}"
     ports:
       - "127.0.0.1:${AUTOSMS_PORT:-8080}:8080"
     volumes:

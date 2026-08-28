@@ -562,6 +562,30 @@ func TestHTTPAndValidationErrors(t *testing.T) {
 	})
 }
 
+func TestTransportErrorRedactsAPIKey(t *testing.T) {
+	const apiKey = "transport-secret-key"
+	client, err := NewClient(Config{
+		APIKey:  apiKey,
+		BaseURL: "https://example.test",
+		HTTPClient: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return nil, &url.Error{Op: "Get", URL: req.URL.String(), Err: errors.New("fixture dial failure")}
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.GetStatus(context.Background(), "100")
+	if err == nil {
+		t.Fatal("expected transport error")
+	}
+	if strings.Contains(err.Error(), apiKey) {
+		t.Fatalf("transport error exposed API key: %v", err)
+	}
+	if !strings.Contains(err.Error(), "api_key=REDACTED") {
+		t.Fatalf("transport error did not retain a redacted URL: %v", err)
+	}
+}
+
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) Do(req *http.Request) (*http.Response, error) { return f(req) }

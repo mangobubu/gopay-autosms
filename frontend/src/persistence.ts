@@ -1,18 +1,22 @@
 import { isSMSProvider } from './smsProviders.ts'
 import type { PriceTier, SMSProvider } from './types'
 
-export const CLIENT_PERSISTENCE_VERSION = 1 as const
+// These keys are kept only so clients upgrading from earlier releases can
+// remove plaintext data that was previously stored in the browser.
 export const API_KEY_STORAGE_KEY = 'gopay-autosms.client.api-key.v1'
 export const SMSBOWER_API_KEY_STORAGE_KEY = API_KEY_STORAGE_KEY
 export const HERO_SMS_API_KEY_STORAGE_KEY = 'gopay-autosms.client.hero-sms-api-key.v1'
 export const BATCH_FORM_STORAGE_KEY = 'gopay-autosms.client.batch-form.v1'
+export const ACTIVE_BATCH_STORAGE_KEY = 'gopay-autosms.active-batch'
 
-const API_KEY_SCHEMA = 'gopay-autosms/api-key'
-const BATCH_FORM_SCHEMA = 'gopay-autosms/batch-form'
+export const LEGACY_CLIENT_STORAGE_KEYS = Object.freeze([
+  API_KEY_STORAGE_KEY,
+  HERO_SMS_API_KEY_STORAGE_KEY,
+  BATCH_FORM_STORAGE_KEY,
+  ACTIVE_BATCH_STORAGE_KEY,
+])
 
 export interface StorageLike {
-  getItem(key: string): string | null
-  setItem(key: string, value: string): void
   removeItem(key: string): void
 }
 
@@ -35,13 +39,6 @@ export interface ClientBatchForm {
   priceSnapshot?: ClientPriceSnapshot
 }
 
-interface PersistenceEnvelope<T> {
-  schema: string
-  version: typeof CLIENT_PERSISTENCE_VERSION
-  data: T
-}
-
-export const DEFAULT_API_KEY = ''
 export const DEFAULT_BATCH_FORM: Readonly<ClientBatchForm> = Object.freeze({
   smsProvider: 'smsbower',
   service: '',
@@ -54,111 +51,6 @@ export const DEFAULT_BATCH_FORM: Readonly<ClientBatchForm> = Object.freeze({
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
-}
-
-function browserStorage(): StorageLike | undefined {
-  try {
-    const storage = globalThis.localStorage
-    if (!storage
-      || typeof storage.getItem !== 'function'
-      || typeof storage.setItem !== 'function'
-      || typeof storage.removeItem !== 'function') return undefined
-    return storage
-  } catch {
-    return undefined
-  }
-}
-
-function resolveStorage(storage?: StorageLike): StorageLike | undefined {
-  return storage ?? browserStorage()
-}
-
-/** Read a storage entry without leaking browser storage exceptions to the UI. */
-export function safeGetItem(storage: StorageLike | undefined, key: string): string | null {
-  if (!storage) return null
-  try {
-    return storage.getItem(key)
-  } catch {
-    return null
-  }
-}
-
-/** Write a storage entry and report quota/privacy-mode failures to the caller. */
-export function safeSetItem(
-  storage: StorageLike | undefined,
-  key: string,
-  value: string,
-): boolean {
-  if (!storage) return false
-  try {
-    storage.setItem(key, value)
-    return true
-  } catch {
-    return false
-  }
-}
-
-/** Remove a storage entry and report privacy-mode failures to the caller. */
-export function safeRemoveItem(storage: StorageLike | undefined, key: string): boolean {
-  if (!storage) return false
-  try {
-    storage.removeItem(key)
-    return true
-  } catch {
-    return false
-  }
-}
-
-function readEnvelope<T>(
-  storage: StorageLike | undefined,
-  key: string,
-  schema: string,
-  normalize: (data: unknown) => T | undefined,
-): T | undefined {
-  const raw = safeGetItem(storage, key)
-  if (raw === null) return undefined
-
-  try {
-    const envelope: unknown = JSON.parse(raw)
-    if (!isRecord(envelope)
-      || envelope.schema !== schema
-      || envelope.version !== CLIENT_PERSISTENCE_VERSION) return undefined
-    return normalize(envelope.data)
-  } catch {
-    return undefined
-  }
-}
-
-function writeEnvelope<T>(
-  storage: StorageLike | undefined,
-  key: string,
-  schema: string,
-  data: T,
-): boolean {
-  const envelope: PersistenceEnvelope<T> = {
-    schema,
-    version: CLIENT_PERSISTENCE_VERSION,
-    data,
-  }
-
-  try {
-    return safeSetItem(storage, key, JSON.stringify(envelope))
-  } catch {
-    return false
-  }
-}
-
-function normalizeApiKey(value: unknown): string | undefined {
-  return typeof value === 'string' ? value.trim() : undefined
-}
-
-/** Keep the client plaintext when the settings endpoint returns an empty or masked key. */
-export function mergeClientApiKey(clientApiKey: string, serverApiKey: string): string {
-  const normalizedClient = normalizeApiKey(clientApiKey) ?? DEFAULT_API_KEY
-  const normalizedServer = normalizeApiKey(serverApiKey) ?? DEFAULT_API_KEY
-  return normalizedServer && !normalizedServer.includes('*')
-    ? normalizedServer
-    : normalizedClient
 }
 
 function normalizePriceSnapshot(value: unknown): ClientPriceSnapshot | undefined {
@@ -176,11 +68,7 @@ function normalizePriceSnapshot(value: unknown): ClientPriceSnapshot | undefined
   return snapshot
 }
 
-/**
- * Convert persisted or caller-provided data into the current form schema.
- * Invalid individual fields fall back independently so one bad field does not
- * discard the rest of a user's draft.
- */
+/** Normalize a server-provided draft into the current client form schema. */
 export function normalizeBatchForm(value: unknown): ClientBatchForm {
   const defaults = { ...DEFAULT_BATCH_FORM }
   if (!isRecord(value)) return defaults
@@ -191,7 +79,9 @@ export function normalizeBatchForm(value: unknown): ClientBatchForm {
     smsProvider,
     service: typeof value.service === 'string' ? value.service : defaults.service,
     country: typeof value.country === 'string' ? value.country : defaults.country,
-    priceKey: typeof value.priceKey === 'string' ? value.priceKey : defaults.priceKey,
+    priceKey: typeof value.priceKey === 'string'
+      ? value.priceKey
+      : typeof value.price_key === 'string' ? value.price_key : defaults.priceKey,
     quantity: typeof value.quantity === 'number'
       && Number.isInteger(value.quantity)
       && value.quantity >= 1
@@ -203,7 +93,7 @@ export function normalizeBatchForm(value: unknown): ClientBatchForm {
       : defaults.pin,
     proxy: typeof value.proxy === 'string' ? value.proxy : defaults.proxy,
   }
-  const priceSnapshot = normalizePriceSnapshot(value.priceSnapshot)
+  const priceSnapshot = normalizePriceSnapshot(value.priceSnapshot ?? value.price_snapshot)
   if (priceSnapshot) {
     if (smsProvider === 'hero-sms') {
       delete priceSnapshot.provider
@@ -215,112 +105,27 @@ export function normalizeBatchForm(value: unknown): ClientBatchForm {
   return normalized
 }
 
-export interface ClientPersistence {
-  loadApiKey(smsProvider?: SMSProvider): string
-  saveApiKey(apiKey: string, smsProvider?: SMSProvider): boolean
-  clearApiKey(smsProvider?: SMSProvider): boolean
-  loadBatchForm(): ClientBatchForm
-  saveBatchForm(form: ClientBatchForm): boolean
-  clearBatchForm(): boolean
-}
-
-/** Create an isolated persistence facade; inject an in-memory storage in tests. */
-export function createClientPersistence(storage?: StorageLike): ClientPersistence {
-  const target = resolveStorage(storage)
-  return {
-    loadApiKey: (smsProvider = 'smsbower') => readEnvelope(
-      target,
-      apiKeyStorageKey(smsProvider),
-      API_KEY_SCHEMA,
-      normalizeApiKey,
-    ) ?? DEFAULT_API_KEY,
-    saveApiKey: (apiKey, smsProvider = 'smsbower') => writeEnvelope(
-      target,
-      apiKeyStorageKey(smsProvider),
-      API_KEY_SCHEMA,
-      normalizeApiKey(apiKey) ?? DEFAULT_API_KEY,
-    ),
-    clearApiKey: (smsProvider = 'smsbower') => safeRemoveItem(
-      target,
-      apiKeyStorageKey(smsProvider),
-    ),
-    loadBatchForm: () => readEnvelope(
-      target,
-      BATCH_FORM_STORAGE_KEY,
-      BATCH_FORM_SCHEMA,
-      normalizeBatchForm,
-    ) ?? { ...DEFAULT_BATCH_FORM },
-    saveBatchForm: (form) => writeEnvelope(
-      target,
-      BATCH_FORM_STORAGE_KEY,
-      BATCH_FORM_SCHEMA,
-      normalizeBatchForm(form),
-    ),
-    clearBatchForm: () => safeRemoveItem(target, BATCH_FORM_STORAGE_KEY),
+function browserStorage(): StorageLike | undefined {
+  try {
+    const storage = globalThis.localStorage
+    return storage && typeof storage.removeItem === 'function' ? storage : undefined
+  } catch {
+    return undefined
   }
 }
 
-function apiKeyStorageKey(smsProvider: SMSProvider): string {
-  return smsProvider === 'hero-sms' ? HERO_SMS_API_KEY_STORAGE_KEY : API_KEY_STORAGE_KEY
-}
+/** Remove plaintext browser state left behind by releases that used localStorage. */
+export function clearLegacyClientPersistence(storage?: StorageLike): boolean {
+  const target = storage ?? browserStorage()
+  if (!target) return false
 
-function providerAndStorage(
-  providerOrStorage?: SMSProvider | StorageLike,
-  storage?: StorageLike,
-): { smsProvider: SMSProvider; storage?: StorageLike } {
-  return typeof providerOrStorage === 'string'
-    ? { smsProvider: providerOrStorage, storage }
-    : { smsProvider: 'smsbower', storage: providerOrStorage }
+  let cleared = true
+  for (const key of LEGACY_CLIENT_STORAGE_KEYS) {
+    try {
+      target.removeItem(key)
+    } catch {
+      cleared = false
+    }
+  }
+  return cleared
 }
-
-export function loadApiKey(storage?: StorageLike): string
-export function loadApiKey(smsProvider: SMSProvider, storage?: StorageLike): string
-export function loadApiKey(
-  providerOrStorage?: SMSProvider | StorageLike,
-  storage?: StorageLike,
-): string {
-  const resolved = providerAndStorage(providerOrStorage, storage)
-  return createClientPersistence(resolved.storage).loadApiKey(resolved.smsProvider)
-}
-
-export function saveApiKey(apiKey: string, storage?: StorageLike): boolean
-export function saveApiKey(
-  apiKey: string,
-  smsProvider: SMSProvider,
-  storage?: StorageLike,
-): boolean
-export function saveApiKey(
-  apiKey: string,
-  providerOrStorage?: SMSProvider | StorageLike,
-  storage?: StorageLike,
-): boolean {
-  const resolved = providerAndStorage(providerOrStorage, storage)
-  return createClientPersistence(resolved.storage).saveApiKey(apiKey, resolved.smsProvider)
-}
-
-export function clearApiKey(storage?: StorageLike): boolean
-export function clearApiKey(smsProvider: SMSProvider, storage?: StorageLike): boolean
-export function clearApiKey(
-  providerOrStorage?: SMSProvider | StorageLike,
-  storage?: StorageLike,
-): boolean {
-  const resolved = providerAndStorage(providerOrStorage, storage)
-  return createClientPersistence(resolved.storage).clearApiKey(resolved.smsProvider)
-}
-
-export function loadBatchForm(storage?: StorageLike): ClientBatchForm {
-  return createClientPersistence(storage).loadBatchForm()
-}
-
-export function saveBatchForm(form: ClientBatchForm, storage?: StorageLike): boolean {
-  return createClientPersistence(storage).saveBatchForm(form)
-}
-
-export function clearBatchForm(storage?: StorageLike): boolean {
-  return createClientPersistence(storage).clearBatchForm()
-}
-
-export const getPersistedApiKey = loadApiKey
-export const setPersistedApiKey = saveApiKey
-export const getPersistedBatchForm = loadBatchForm
-export const setPersistedBatchForm = saveBatchForm

@@ -114,6 +114,19 @@ func (s *verificationResendFlowStore) AppendVerificationCodeOwned(
 	if params.ActivationID != s.activation.ID || owner != s.activation.LeaseOwner || leaseVersion != s.activation.LeaseVersion {
 		return storage.AppendVerificationResult{}, storage.ErrConflict
 	}
+	for _, existing := range s.verifications {
+		if existing.ActivationID == params.ActivationID && existing.CycleNo == params.CycleNo {
+			return storage.AppendVerificationResult{
+				Verification: domain.VerificationCode{
+					ActivationID: existing.ActivationID,
+					CycleNo:      existing.CycleNo,
+					Phase:        existing.Phase,
+					Code:         existing.Code,
+				},
+				Inserted: false,
+			}, nil
+		}
+	}
 	s.verifications = append(s.verifications, params)
 	return storage.AppendVerificationResult{
 		Verification: domain.VerificationCode{

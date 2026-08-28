@@ -2,19 +2,13 @@ package domain
 
 import "testing"
 
-func TestNormalizePhoneAndFingerprint(t *testing.T) {
+func TestNormalizePhone(t *testing.T) {
 	normalized, err := NormalizePhone(" +62 (812) 345-678 ")
 	if err != nil {
 		t.Fatalf("NormalizePhone() error = %v", err)
 	}
 	if normalized != "+62812345678" {
 		t.Fatalf("NormalizePhone() = %q", normalized)
-	}
-	if PhoneFingerprint(normalized) != PhoneFingerprint("+62812345678") {
-		t.Fatal("fingerprint must be deterministic")
-	}
-	if PhoneFingerprint(normalized) == PhoneFingerprint("+62812345679") {
-		t.Fatal("different phones unexpectedly shared a fingerprint")
 	}
 }
 
@@ -116,5 +110,21 @@ func TestPINWorkflowStatusesAreValid(t *testing.T) {
 		if !status.Valid() {
 			t.Fatalf("%q should be valid", status)
 		}
+	}
+}
+
+func TestHeroSMSWebhookEventStatusesAreValid(t *testing.T) {
+	for _, status := range []HeroSMSWebhookEventStatus{
+		HeroSMSWebhookEventReceived,
+		HeroSMSWebhookEventProcessing,
+		HeroSMSWebhookEventProcessed,
+		HeroSMSWebhookEventIgnored,
+	} {
+		if !status.Valid() {
+			t.Fatalf("%q should be a valid HeroSMS webhook event status", status)
+		}
+	}
+	if HeroSMSWebhookEventStatus("failed").Valid() {
+		t.Fatal("unknown HeroSMS webhook event status unexpectedly valid")
 	}
 }

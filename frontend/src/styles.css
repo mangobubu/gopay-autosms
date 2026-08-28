@@ -131,6 +131,28 @@ textarea {
   font-size: 13px;
 }
 
+.hero-sms-entry {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  margin-right: 8px;
+  padding: 0 12px;
+  color: #dce8fb;
+  border: 1px solid rgba(135, 172, 231, 0.28);
+  border-radius: 10px;
+  background: rgba(43, 100, 198, 0.18);
+  font-size: 12px;
+  font-weight: 750;
+  text-decoration: none;
+  transition: border-color 0.18s ease, background 0.18s ease;
+}
+
+.hero-sms-entry:hover {
+  color: #fff;
+  border-color: rgba(145, 185, 248, 0.52);
+  background: rgba(52, 116, 224, 0.3);
+}
+
 .live-dot,
 .status-pulse {
   display: inline-block;
@@ -1031,6 +1053,13 @@ textarea {
 
   .topbar__state {
     font-size: 0;
+  }
+
+  .hero-sms-entry {
+    min-height: 32px;
+    margin-right: 3px;
+    padding: 0 9px;
+    font-size: 11px;
   }
 
   .workspace {

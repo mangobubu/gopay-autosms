@@ -2,8 +2,8 @@ package storage
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"time"
@@ -24,7 +24,14 @@ func (s *PostgresStore) AcquireAccountSessionLock(ctx context.Context, phone str
 	if err != nil {
 		return nil, ErrInvalidInput
 	}
-	digest := sha256.Sum256([]byte("autosms:gopay-session:" + normalized))
+	lockIndex, err := blindIndex(s.protector, accountSessionLockPurpose, []byte(normalized))
+	if err != nil {
+		return nil, err
+	}
+	digest, err := hex.DecodeString(lockIndex)
+	if err != nil || len(digest) < 8 {
+		return nil, fmt.Errorf("invalid account session lock index")
+	}
 	key := int64(binary.BigEndian.Uint64(digest[:8]))
 
 	for {

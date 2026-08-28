@@ -58,6 +58,10 @@ type Session struct {
 	ProxyURL    string         `json:"proxy_url,omitempty"`
 	DeviceToken string         `json:"device_token,omitempty"`
 	SMSCycle    int            `json:"sms_cycle"`
+	// WorkflowActivationID binds a pre-dispatch login checkpoint to the exact
+	// purchased number which created it. It prevents a later activation which
+	// happens to reuse the same phone from adopting an older uncertain session.
+	WorkflowActivationID int64 `json:"workflow_activation_id,omitempty"`
 	// VerificationCycleRequest records the provider setStatus=3 intent before
 	// the external call and its acknowledgement before the local SMS cycle is
 	// advanced. This distinguishes a first BAD_STATUS from crash recovery.

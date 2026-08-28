@@ -81,6 +81,10 @@ func (s *loginFailureStore) GetActivation(context.Context, int64) (domain.Activa
 	return domain.Activation{}, storage.ErrNotFound
 }
 
+func (s *loginFailureStore) GetAccountByPhone(context.Context, string) (domain.Account, error) {
+	return domain.Account{}, storage.ErrNotFound
+}
+
 func (s *loginFailureStore) GetSetting(_ context.Context, key string) (domain.Setting, error) {
 	if key != s.setting.Key {
 		return domain.Setting{}, storage.ErrNotFound

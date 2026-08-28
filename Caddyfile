@@ -1,0 +1,43 @@
+{
+	# reverse_proxy operational errors include request.uri. Redact the secret
+	# webhook path segment before any default/runtime logger serializes it.
+	log default {
+		format filter {
+			request>uri regexp ^/api/webhooks/hero-sms/[^/?]+ /api/webhooks/hero-sms/REDACTED
+		}
+	}
+}
+
+{$AUTOSMS_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "same-origin"
+		-Server
+	}
+
+	# Readiness performs a database round trip and is used only by Docker on the
+	# private application port. Keep it off the public Internet.
+	handle /readyz {
+		respond 404
+	}
+
+	# HeroSMS currently documents these two callback source addresses. The long
+	# URL token remains the primary webhook credential; this allowlist adds a
+	# second boundary before the request reaches the application.
+	handle /api/webhooks/hero-sms/* {
+		@hero_sms_source remote_ip 84.32.223.53 185.138.88.87
+		handle @hero_sms_source {
+			reverse_proxy autosms:8080
+		}
+		handle {
+			respond 403
+		}
+	}
+
+	handle {
+		reverse_proxy autosms:8080
+	}
+}

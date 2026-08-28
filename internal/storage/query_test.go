@@ -20,17 +20,18 @@ func TestNormalizePage(t *testing.T) {
 
 func TestBuildActivationListQuery(t *testing.T) {
 	batchID := int64(7)
+	phoneFingerprint := strings.Repeat("a", blindIndexEncodedLength)
 	query, args := buildActivationListQuery(ActivationFilter{
-		BatchID:       &batchID,
-		Statuses:      []domain.ActivationStatus{domain.ActivationStatusActive},
-		PhoneContains: "8123",
-		Page:          Page{Limit: 20, Offset: 40},
-	})
+		BatchID:    &batchID,
+		Statuses:   []domain.ActivationStatus{domain.ActivationStatusActive},
+		PhoneExact: "+628123456789",
+		Page:       Page{Limit: 20, Offset: 40},
+	}, phoneFingerprint)
 	for _, expected := range []string{
 		"batch_id=$1",
 		"status=ANY($2::text[])",
 		"hidden_at IS NULL",
-		"phone_number ILIKE $3",
+		"phone_fingerprint=$3",
 		"ORDER BY (ever_fulfilled OR status='success') DESC, (finished_at IS NULL) DESC, status_changed_at DESC, created_at DESC, id DESC",
 		"LIMIT $4 OFFSET $5",
 	} {
@@ -38,13 +39,13 @@ func TestBuildActivationListQuery(t *testing.T) {
 			t.Fatalf("query %q does not contain %q", query, expected)
 		}
 	}
-	if len(args) != 5 || args[0] != batchID || args[2] != "%8123%" || args[3] != 20 || args[4] != 40 {
+	if len(args) != 5 || args[0] != batchID || args[2] != phoneFingerprint || args[3] != 20 || args[4] != 40 {
 		t.Fatalf("args = %#v", args)
 	}
 }
 
 func TestBuildActivationListQueryCanIncludeHidden(t *testing.T) {
-	query, _ := buildActivationListQuery(ActivationFilter{IncludeHidden: true})
+	query, _ := buildActivationListQuery(ActivationFilter{IncludeHidden: true}, "")
 	if strings.Contains(query, "hidden_at IS NULL") {
 		t.Fatalf("query unexpectedly filters hidden rows: %s", query)
 	}

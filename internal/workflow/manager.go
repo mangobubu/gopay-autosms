@@ -77,6 +77,20 @@ type CreateBatchInput struct {
 	Proxies     []proxyaddr.Entry
 }
 
+// HeroSMSWebhookPayload is the provider callback after the HTTP boundary has
+// authenticated and decoded it. Pointer fields retain HeroSMS's documented
+// null values; RawPayload preserves the exact callback for durable auditing.
+type HeroSMSWebhookPayload struct {
+	ActivationID string
+	PhoneFrom    string
+	Service      string
+	Text         *string
+	Code         *string
+	Country      int
+	ReceivedAt   time.Time
+	RawPayload   json.RawMessage
+}
+
 type Manager struct {
 	store    storage.Store
 	settings *appsettings.Manager
@@ -153,7 +167,7 @@ func New(store storage.Store, settings *appsettings.Manager, box *secure.Box, cf
 
 func (m *Manager) Run(ctx context.Context) error {
 	m.startOnce.Do(func() {
-		m.startErr = m.cancelStartupBatches(ctx)
+		m.startErr = m.recoverStartupBatches(ctx)
 		if m.startErr != nil {
 			return
 		}
@@ -167,6 +181,37 @@ func (m *Manager) Run(ctx context.Context) error {
 }
 
 func (m *Manager) Wait() { m.wg.Wait() }
+
+// ReceiveHeroSMSWebhook durably records every authenticated callback before
+// returning to the HTTP handler. Ingestion also wakes a matching activation;
+// callbacks which beat activation creation remain unattached in the inbox and
+// are associated when the worker later claims them.
+func (m *Manager) ReceiveHeroSMSWebhook(ctx context.Context, payload HeroSMSWebhookPayload) error {
+	inbox, ok := m.store.(storage.HeroSMSWebhookStore)
+	if !ok {
+		return fmt.Errorf("HeroSMS webhook inbox is not configured")
+	}
+	providerReceivedAt := payload.ReceivedAt.UTC()
+	_, err := inbox.IngestHeroSMSWebhook(ctx, storage.IngestHeroSMSWebhookParams{
+		ProviderActivationID: strings.TrimSpace(payload.ActivationID),
+		Code:                 cloneOptionalString(payload.Code),
+		Text:                 cloneOptionalString(payload.Text),
+		PhoneNumber:          strings.TrimSpace(payload.PhoneFrom),
+		ServiceCode:          strings.TrimSpace(payload.Service),
+		CountryCode:          strconv.Itoa(payload.Country),
+		ProviderReceivedAt:   &providerReceivedAt,
+		RawPayload:           append(json.RawMessage(nil), payload.RawPayload...),
+	})
+	return err
+}
+
+func cloneOptionalString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
 
 func (m *Manager) CreateBatch(ctx context.Context, input CreateBatchInput) (domain.Batch, error) {
 	if err := domain.ValidatePIN(input.PIN); err != nil {
@@ -1161,6 +1206,13 @@ func (m *Manager) probeAndStartLogin(ctx context.Context, activation domain.Acti
 	if err != nil {
 		return err
 	}
+	// A previous worker may have stopped after persisting its non-idempotent
+	// initial OTP intent but before attaching the account or changing the
+	// activation status. Adopt that checkpoint instead of probing and sending a
+	// second uncounted OTP.
+	if recovered, recoverErr := m.recoverPreparedInitialLogin(ctx, activation); recoverErr != nil || recovered {
+		return recoverErr
+	}
 	proxyURL, err := m.claimProxy(ctx, batch)
 	if err != nil {
 		return err
@@ -1195,24 +1247,89 @@ func (m *Manager) probeAndStartLogin(ctx context.Context, activation domain.Acti
 	if err != nil {
 		return err
 	}
-	if _, err = client.StartLogin(ctx); err != nil {
-		return err
-	}
 	state := client.State()
 	state.SMSCycle = activation.SMSCycle
-	state.LoginCodeSentAt = time.Now().UTC()
+	state.WorkflowActivationID = activation.ID
+	state.LoginStage = gopay.LoginStageAwaiting1FAOTP
+	state.LoginCodeDispatchUncertain = true
+	state.LoginCodeSentAt = time.Time{}
 	state.LoginCodeResends = 0
 	client.Restore(state)
 	account, err := m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPending, nil)
 	if err != nil {
 		return err
 	}
+	// From here on the claimed proxy is durably recoverable from the encrypted
+	// session, even if a following association write is interrupted.
+	keepProxy = true
 	if err = m.store.AttachActivationAccountOwned(ctx, activation.ID, account.ID, activation.LeaseOwner, activation.LeaseVersion); err != nil {
 		return err
 	}
-	keepProxy = true
-	_, err = m.store.TransitionActivationOwned(ctx, activation.ID, []domain.ActivationStatus{domain.ActivationStatusPurchased}, domain.ActivationStatusAwaitingLoginCode, "", activation.LeaseOwner, activation.LeaseVersion)
+	if _, err = m.store.TransitionActivationOwned(ctx, activation.ID,
+		[]domain.ActivationStatus{domain.ActivationStatusPurchased},
+		domain.ActivationStatusAwaitingLoginCode, "",
+		activation.LeaseOwner, activation.LeaseVersion,
+	); err != nil {
+		return err
+	}
+
+	// StartLogin can deliver an OTP. The uncertain checkpoint above is therefore
+	// the last durable write before this call. Only a successfully persisted
+	// response clears it and records the new OTP token.
+	if _, err = client.StartLogin(ctx); err != nil {
+		return err
+	}
+	state = client.State()
+	state.SMSCycle = activation.SMSCycle
+	state.WorkflowActivationID = activation.ID
+	state.LoginCodeSentAt = time.Now().UTC()
+	state.LoginCodeResends = 0
+	state.LoginCodeDispatchUncertain = false
+	client.Restore(state)
+	_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPending, nil)
 	return err
+}
+
+// recoverPreparedInitialLogin repairs the two local write gaps between saving
+// the initial dispatch intent, attaching its account and transitioning the
+// activation. No provider or GoPay call is made on this path.
+func (m *Manager) recoverPreparedInitialLogin(
+	ctx context.Context,
+	activation domain.Activation,
+) (bool, error) {
+	account, err := m.store.GetAccountByPhone(ctx, activation.PhoneNumber)
+	if errors.Is(err, storage.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	raw, err := m.box.Open(account.CredentialsEnc)
+	if err != nil {
+		return false, err
+	}
+	state, err := gopay.ParseSession(raw)
+	if err != nil {
+		return false, err
+	}
+	if state.WorkflowActivationID != activation.ID ||
+		!state.LoginCodeDispatchUncertain ||
+		state.LoginStage != gopay.LoginStageAwaiting1FAOTP {
+		return false, nil
+	}
+	if activation.AccountID == nil || *activation.AccountID != account.ID {
+		if err = m.store.AttachActivationAccountOwned(
+			ctx, activation.ID, account.ID, activation.LeaseOwner, activation.LeaseVersion,
+		); err != nil {
+			return true, err
+		}
+	}
+	_, err = m.store.TransitionActivationOwned(ctx, activation.ID,
+		[]domain.ActivationStatus{domain.ActivationStatusPurchased},
+		domain.ActivationStatusAwaitingLoginCode, "",
+		activation.LeaseOwner, activation.LeaseVersion,
+	)
+	return true, err
 }
 
 func (m *Manager) cancelAndClassify(ctx context.Context, activation domain.Activation, status domain.ActivationStatus, reason string) error {
@@ -1257,6 +1374,9 @@ func (m *Manager) finalizeProviderAction(ctx context.Context, activation domain.
 }
 
 func (m *Manager) pollLoginCode(ctx context.Context, activation domain.Activation) error {
+	if isHeroSMSActivation(activation) {
+		return m.waitHeroSMSLoginCode(ctx, activation)
+	}
 	batch, _, client, err := m.restoreGoPayClient(ctx, activation)
 	if err != nil {
 		return err
@@ -1575,6 +1695,9 @@ func (m *Manager) checkBalance(ctx context.Context, activation domain.Activation
 }
 
 func (m *Manager) pollPINCode(ctx context.Context, activation domain.Activation) error {
+	if isHeroSMSActivation(activation) {
+		return m.waitHeroSMSPINCode(ctx, activation)
+	}
 	batch, _, client, err := m.restoreGoPayClient(ctx, activation)
 	if err != nil {
 		return err
@@ -1898,6 +2021,11 @@ func (m *Manager) recoverExpiredPINVerification(ctx context.Context, activation 
 }
 
 func (m *Manager) completePINSetting(ctx context.Context, activation domain.Activation) error {
+	if isHeroSMSActivation(activation) {
+		if err := m.reconcileHeroSMSConsumedEvents(ctx, activation, domain.VerificationPhasePIN); err != nil {
+			return err
+		}
+	}
 	batch, _, client, err := m.restoreGoPayClient(ctx, activation)
 	if err != nil {
 		return err
@@ -1977,6 +2105,13 @@ func pinStatusDisplayDuration(pollInterval time.Duration) time.Duration {
 }
 
 func (m *Manager) transitionToSubsequentPolling(ctx context.Context, activation domain.Activation) error {
+	if isHeroSMSActivation(activation) {
+		var err error
+		activation, err = m.ensureHeroSMSFollowupCycle(ctx, activation)
+		if err != nil {
+			return err
+		}
+	}
 	if _, err := m.store.TransitionActivationOwned(ctx, activation.ID,
 		[]domain.ActivationStatus{domain.ActivationStatusPINChanged},
 		domain.ActivationStatusAwaitingSubsequentCode, "",
@@ -1984,10 +2119,16 @@ func (m *Manager) transitionToSubsequentPolling(ctx context.Context, activation 
 		return err
 	}
 	now := time.Now().UTC()
+	if isHeroSMSActivation(activation) {
+		return m.scheduleHeroSMSWait(ctx, activation, m.heroSMSProviderDeadline(activation))
+	}
 	return m.store.TouchActivationPoll(ctx, activation.ID, activation.LeaseOwner, now, now)
 }
 
 func (m *Manager) pollFollowupCode(ctx context.Context, activation domain.Activation) error {
+	if isHeroSMSActivation(activation) {
+		return m.waitHeroSMSFollowupCode(ctx, activation)
+	}
 	status, err := m.pollStatus(ctx, activation)
 	if err != nil || status.Kind != smsbower.StatusOK {
 		return err
@@ -2126,11 +2267,10 @@ func persistVerificationCycleCheckpoint(
 }
 
 func (m *Manager) appendCode(ctx context.Context, activation domain.Activation, phase domain.VerificationPhase, code string) (string, error) {
-	payload, _ := json.Marshal(map[string]string{"code": code})
-	now := time.Now().UTC()
+	payload, receivedAt := verificationProviderMetadata(ctx, code)
 	params := storage.AppendVerificationParams{
 		ActivationID: activation.ID, CycleNo: activation.SMSCycle, Phase: phase,
-		Code: code, ProviderPayload: payload, ProviderReceivedAt: &now,
+		Code: code, ProviderPayload: payload, ProviderReceivedAt: receivedAt,
 	}
 	owned, ok := m.store.(storage.OwnedVerificationStore)
 	if !ok {

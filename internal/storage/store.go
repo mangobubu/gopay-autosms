@@ -35,7 +35,7 @@ type ActivationFilter struct {
 	BatchID       *int64
 	Statuses      []domain.ActivationStatus
 	IncludeHidden bool
-	PhoneContains string
+	PhoneExact    string
 	Page          Page
 }
 
@@ -113,6 +113,22 @@ type AppendVerificationParams struct {
 type AppendVerificationResult struct {
 	Verification domain.VerificationCode
 	Inserted     bool
+}
+
+type IngestHeroSMSWebhookParams struct {
+	ProviderActivationID string
+	Code                 *string
+	Text                 *string
+	PhoneNumber          string
+	ServiceCode          string
+	CountryCode          string
+	ProviderReceivedAt   *time.Time
+	RawPayload           json.RawMessage
+}
+
+type IngestHeroSMSWebhookResult struct {
+	Event    domain.HeroSMSWebhookEvent
+	Inserted bool
 }
 
 type UpsertAccountParams struct {
@@ -220,6 +236,18 @@ type VerificationStore interface {
 // preserving source compatibility for API and lightweight non-worker stores.
 type OwnedVerificationStore interface {
 	AppendVerificationCodeOwned(context.Context, AppendVerificationParams, string, int64) (AppendVerificationResult, error)
+}
+
+// HeroSMSWebhookStore is an optional worker/HTTP capability. It is deliberately
+// separate from Store so integrations which do not enable HeroSMS webhooks do
+// not need to implement inbox semantics. PostgreSQL implements the complete
+// interface.
+type HeroSMSWebhookStore interface {
+	IngestHeroSMSWebhook(context.Context, IngestHeroSMSWebhookParams) (IngestHeroSMSWebhookResult, error)
+	ClaimNextHeroSMSWebhookEventOwned(context.Context, int64, string, int64, time.Time) (domain.HeroSMSWebhookEvent, error)
+	CompleteHeroSMSWebhookEventOwned(context.Context, int64, int64, string, int64) error
+	IgnoreHeroSMSWebhookEventOwned(context.Context, int64, int64, string, int64, string) error
+	FailHeroSMSWebhookEventOwned(context.Context, int64, int64, string, int64, time.Time, string) error
 }
 
 type AccountStore interface {

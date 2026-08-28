@@ -13,6 +13,7 @@ import (
 
 type PostgresConfig struct {
 	URL             string
+	Protector       Protector
 	MaxConns        int32
 	MinConns        int32
 	MaxConnLifetime time.Duration
@@ -20,7 +21,8 @@ type PostgresConfig struct {
 }
 
 type PostgresStore struct {
-	pool *pgxpool.Pool
+	pool      *pgxpool.Pool
+	protector Protector
 }
 
 // OpenPostgres establishes the pool, verifies connectivity and applies schema
@@ -28,6 +30,12 @@ type PostgresStore struct {
 func OpenPostgres(ctx context.Context, cfg PostgresConfig) (*PostgresStore, error) {
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("open postgres: %w: empty URL", ErrInvalidInput)
+	}
+	if cfg.Protector == nil {
+		return nil, fmt.Errorf("open postgres: %w: missing sensitive-data protector", ErrInvalidInput)
+	}
+	if _, ok := cfg.Protector.(BlindIndexer); !ok {
+		return nil, fmt.Errorf("open postgres: %w: protector does not support blind indexes", ErrInvalidInput)
 	}
 	poolCfg, err := pgxpool.ParseConfig(cfg.URL)
 	if err != nil {
@@ -49,12 +57,12 @@ func OpenPostgres(ctx context.Context, cfg PostgresConfig) (*PostgresStore, erro
 	if err != nil {
 		return nil, fmt.Errorf("create postgres pool: %w", err)
 	}
-	store := &PostgresStore{pool: pool}
+	store := &PostgresStore{pool: pool, protector: cfg.Protector}
 	if err = store.Ping(ctx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	if err = Migrate(ctx, pool); err != nil {
+	if err = Migrate(ctx, pool, cfg.Protector); err != nil {
 		pool.Close()
 		return nil, err
 	}

@@ -277,7 +277,7 @@ func (c *Client) call(ctx context.Context, action string, params map[string]stri
 	req.Header.Set("User-Agent", "gopay-autosms/1.0")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("smsbower %s request: %w", action, err)
+		return nil, fmt.Errorf("smsbower %s request: %w", action, RedactRequestError(err))
 	}
 	defer resp.Body.Close()
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
@@ -296,6 +296,30 @@ func (c *Client) call(ctx context.Context, action string, params map[string]stri
 		return nil, &APIError{Action: action, Code: "EMPTY_RESPONSE", Message: "provider returned an empty response"}
 	}
 	return body, nil
+}
+
+// RedactRequestError removes query credentials from net/url transport errors
+// before callers persist or expose them. The copied error keeps its underlying
+// cause, so errors.Is still recognizes context cancellation and timeouts.
+func RedactRequestError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var requestErr *url.Error
+	if !errors.As(err, &requestErr) {
+		return err
+	}
+	redacted := *requestErr
+	parsed, parseErr := url.Parse(requestErr.URL)
+	if parseErr == nil {
+		query := parsed.Query()
+		if _, present := query["api_key"]; present {
+			query.Set("api_key", "REDACTED")
+			parsed.RawQuery = query.Encode()
+		}
+		redacted.URL = parsed.String()
+	}
+	return &redacted
 }
 
 func trimResponse(body []byte) []byte {

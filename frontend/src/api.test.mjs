@@ -103,6 +103,51 @@ test('routes settings and catalog requests through the selected SMS provider', a
   assert.equal(requests[4].init.cache, 'no-store')
 })
 
+test('loads and saves the complete batch draft through the server settings endpoint', async (t) => {
+  const originalFetch = globalThis.fetch
+  t.after(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  const requests = []
+  globalThis.fetch = async (input, init) => {
+    requests.push({ input, init })
+    return new Response('{}', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+
+  await api.getBatchDraft()
+  await api.saveBatchDraft({
+    smsProvider: 'hero-sms',
+    service: 'tg',
+    country: '6',
+    priceKey: 'offer-7',
+    quantity: 3,
+    pin: '123',
+    proxy: 'socks5://user:pass@proxy.example:1080',
+    priceSnapshot: { value: 'offer-7', price: 1.25 },
+  })
+
+  assert.deepEqual(requests.map(({ input }) => input), [
+    '/api/settings/batch-draft',
+    '/api/settings/batch-draft',
+  ])
+  assert.equal(requests[0].init.cache, 'no-store')
+  assert.equal(requests[1].init.method, 'PUT')
+  assert.deepEqual(JSON.parse(requests[1].init.body), {
+    sms_provider: 'hero-sms',
+    service: 'tg',
+    country: '6',
+    price_key: 'offer-7',
+    quantity: 3,
+    pin: '123',
+    proxy: 'socks5://user:pass@proxy.example:1080',
+    price_snapshot: { value: 'offer-7', price: 1.25 },
+  })
+})
+
 test('sends the selected SMS provider without inventing a HeroSMS currency', async (t) => {
   const originalFetch = globalThis.fetch
   t.after(() => {
