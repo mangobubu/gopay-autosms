@@ -28,7 +28,7 @@ func (s BatchStatus) Terminal() bool {
 
 func (s ActivationStatus) Valid() bool {
 	switch s {
-	case ActivationStatusPurchased, ActivationStatusDuplicate, ActivationStatusAwaitingLoginCode,
+	case ActivationStatusPurchased, ActivationStatusDuplicate, ActivationStatusPhoneInUse, ActivationStatusAwaitingLoginCode,
 		ActivationStatusLoggingIn, ActivationStatusPINRequired, ActivationStatusUnregistered,
 		ActivationStatusLoginFailed, ActivationStatusLoginCodeTimeout,
 		ActivationStatusCheckingBalance, ActivationStatusZeroBalanceUsed, ActivationStatusSettingPIN,
@@ -98,8 +98,9 @@ func NormalizePhone(phone string) (string, error) {
 	return normalized, nil
 }
 
-// PhoneFingerprint avoids keeping an extra clear-text unique index while still
-// providing deterministic, atomic history de-duplication.
+// PhoneFingerprint provides a stable, non-clear-text lookup key for account
+// state and for preventing two unfinished activations from using the same
+// remote GoPay session at once. Finished numbers remain eligible for reuse.
 func PhoneFingerprint(normalizedPhone string) string {
 	sum := sha256.Sum256([]byte(normalizedPhone))
 	return hex.EncodeToString(sum[:])

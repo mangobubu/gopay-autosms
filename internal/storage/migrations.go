@@ -311,6 +311,31 @@ var migrations = []migration{
 				AND inflight_count=0`,
 		},
 	},
+	{
+		version: 8,
+		statements: []string{
+			// Older workers overwrote the durable unregistered classification
+			// while retrying HeroSMS finalization. Match only that complete legacy
+			// error shape, while accepting the old SMSBower and new HeroSMS labels.
+			`UPDATE activations SET
+				failure_reason='未注册',
+				updated_at=now()
+			WHERE status='unregistered'
+				AND failure_reason ~* '^[[:space:]]*(smsbower|herosms)[[:space:]]+setstatus[[:space:]]*:[[:space:]]*http_409[[:space:]]*:[[:space:]]*conflict[[:space:]]*$'`,
+		},
+	},
+	{
+		version: 9,
+		statements: []string{
+			// Quantity is the successful-activation target. Provider allocations
+			// that later fail release an inflight slot and may be replaced, so the
+			// lifetime purchased_count is intentionally not capacity constrained.
+			`ALTER TABLE batches DROP CONSTRAINT IF EXISTS batches_active_purchase_capacity_chk`,
+			`ALTER TABLE batches ADD CONSTRAINT batches_success_slot_capacity_chk
+				CHECK (fulfilled_count+inflight_count+purchase_reserved_count <= quantity)`,
+			`DROP TABLE IF EXISTS phone_history`,
+		},
+	},
 }
 
 // Migrate applies all storage migrations under one transaction-scoped advisory

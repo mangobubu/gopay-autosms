@@ -75,7 +75,10 @@ type CreateActivationParams struct {
 
 type CreateActivationResult struct {
 	Activation domain.Activation
-	Duplicate  bool
+	// Duplicate is retained for lightweight store/mock source compatibility.
+	// New activations are no longer classified by historical phone usage, so
+	// production storage always leaves it false.
+	Duplicate bool
 }
 
 type PurchaseAttemptState string
@@ -171,10 +174,17 @@ type BatchStore interface {
 	UpdateBatchConfig(context.Context, int64, json.RawMessage) error
 }
 
+// ProxyExhaustionStore is an optional capability used by the scheduler to
+// atomically stop a one-shot proxy batch once no work remains in flight. It is
+// separate from BatchStore so lightweight Store test doubles and integrations
+// do not need to implement this optimization.
+type ProxyExhaustionStore interface {
+	FailBatchForExhaustedProxies(context.Context, int64, string) (domain.Batch, error)
+}
+
 type ActivationStore interface {
-	// CreateActivationAtomically inserts the activation and reserves its phone
-	// fingerprint in the same transaction. A historical number is returned with
-	// Duplicate=true and remains reserved until remote cancellation finalizes it.
+	// CreateActivationAtomically inserts the activation and consumes its durable
+	// provider-purchase reservation in the same transaction.
 	CreateActivationAtomically(context.Context, CreateActivationParams) (CreateActivationResult, error)
 	GetActivation(context.Context, int64) (domain.Activation, error)
 	GetActivationByProviderID(context.Context, string, string) (domain.Activation, error)
@@ -198,7 +208,6 @@ type ActivationStore interface {
 	ClearControlAction(context.Context, int64, domain.ControlAction) error
 	SoftDeleteActivation(context.Context, int64) error
 	HideActivation(context.Context, int64) error
-	GetPhoneHistory(context.Context, string) (domain.PhoneHistory, error)
 }
 
 type VerificationStore interface {

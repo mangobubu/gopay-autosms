@@ -27,7 +27,8 @@ import (
 
 const (
 	purchaseCleanupWorkerCount  = 4
-	verificationCodeWait        = 60 * time.Second
+	loginVerificationCodeWait   = 60 * time.Second
+	pinVerificationCodeWait     = 80 * time.Second
 	verificationCodeResends     = 3
 	verificationCheckpointSaves = 3
 	verificationCheckpointRetry = 25 * time.Millisecond
@@ -171,7 +172,8 @@ func (m *Manager) CreateBatch(ctx context.Context, input CreateBatchInput) (doma
 	if err := domain.ValidatePIN(input.PIN); err != nil {
 		return domain.Batch{}, err
 	}
-	if input.Quantity <= 0 || strings.TrimSpace(input.ServiceCode) == "" || strings.TrimSpace(input.CountryCode) == "" || strings.TrimSpace(input.MaxPrice) == "" {
+	if input.Quantity <= 0 || input.Quantity > domain.MaxBatchQuantity ||
+		strings.TrimSpace(input.ServiceCode) == "" || strings.TrimSpace(input.CountryCode) == "" || strings.TrimSpace(input.MaxPrice) == "" {
 		return domain.Batch{}, storage.ErrInvalidInput
 	}
 	provider, err := smsprovider.Normalize(input.Options.SMSProvider)
@@ -467,6 +469,13 @@ func (m *Manager) runTick(ctx context.Context) {
 		m.logger.Error("list purchase batches", "error", err)
 	} else {
 		for _, batch := range batches {
+			if batchProxyPoolExhausted(batch) {
+				failErr := m.failBatchForExhaustedProxies(ctx, batch.ID)
+				if failErr != nil && !errors.Is(failErr, storage.ErrConflict) {
+					m.logger.Error("fail batch with exhausted proxy pool", "batch_id", batch.ID, "error", failErr)
+				}
+				continue
+			}
 			if batchReadyForPurchase(batch, time.Now()) {
 				m.purchaseBatch(ctx, batch)
 			}
@@ -606,11 +615,34 @@ func (m *Manager) unregisterWorker(batchID, activationID, leaseVersion int64) {
 	}
 }
 
+func (m *Manager) failBatchForExhaustedProxies(ctx context.Context, batchID int64) error {
+	const reason = "代理池已耗尽，成功数量未达到计划购买数量，任务已停止"
+	if store, ok := m.store.(storage.ProxyExhaustionStore); ok {
+		_, err := store.FailBatchForExhaustedProxies(ctx, batchID, reason)
+		return err
+	}
+	// Lightweight stores predating the optional atomic operation still get a
+	// useful best-effort transition; the production Postgres store takes the
+	// guarded path above.
+	_, err := m.store.TransitionBatch(ctx, batchID,
+		[]domain.BatchStatus{domain.BatchStatusPending, domain.BatchStatusRunning},
+		domain.BatchStatusFailed, reason)
+	return err
+}
+
 func batchReadyForPurchase(batch domain.Batch, now time.Time) bool {
 	return !batch.Status.Terminal() &&
+		(batch.ProxyTotal == 0 || batch.ProxyAvailable > 0) &&
 		batch.PurchaseReservedCount == 0 &&
-		batch.PurchasedCount < batch.Quantity &&
+		batch.FulfilledCount+batch.InflightCount+batch.PurchaseReservedCount < batch.Quantity &&
 		!batch.NextPurchaseAt.After(now)
+}
+
+func batchProxyPoolExhausted(batch domain.Batch) bool {
+	return !batch.Status.Terminal() &&
+		batch.ProxyTotal > 0 && batch.ProxyAvailable == 0 &&
+		batch.FulfilledCount < batch.Quantity &&
+		batch.InflightCount == 0 && batch.PurchaseReservedCount == 0
 }
 
 func (m *Manager) purchaseBatch(ctx context.Context, batch domain.Batch) {
@@ -747,7 +779,7 @@ func (m *Manager) purchaseOne(ctx context.Context, batch domain.Batch) {
 		Currency: firstNonEmpty(purchased.Currency, batch.Currency), ProviderPayload: payload,
 		ProviderExpiresAt: &expires, NextRunAt: time.Now().UTC(),
 	}
-	created, err := m.persistPurchasedActivation(ctx, params)
+	_, err = m.persistPurchasedActivation(ctx, params)
 	if err != nil {
 		reason := fmt.Sprintf("%s 号码 %s 落库异常，已停止自动补购: %v", provider, purchased.ActivationID, err)
 		resolvedState, freezeErr := m.freezePurchase(ctx, batch.ID, purchaseToken, provider, purchased.ActivationID, reason)
@@ -763,9 +795,6 @@ func (m *Manager) purchaseOne(ctx context.Context, batch domain.Batch) {
 		}
 		m.logger.Warn("queued durable cleanup for unpersisted number", "provider_id", purchased.ActivationID)
 		return
-	}
-	if created.Duplicate {
-		m.logger.Info("historical number detected; cancellation queued", "activation_id", created.Activation.ID)
 	}
 }
 
@@ -901,7 +930,8 @@ func (m *Manager) processActivation(ctx context.Context, activation domain.Activ
 			} else {
 				err = m.probeAndStartLogin(ctx, activation)
 			}
-		case domain.ActivationStatusDuplicate, domain.ActivationStatusPINRequired, domain.ActivationStatusUnregistered,
+		case domain.ActivationStatusDuplicate, domain.ActivationStatusPhoneInUse,
+			domain.ActivationStatusPINRequired, domain.ActivationStatusUnregistered,
 			domain.ActivationStatusLoginFailed, domain.ActivationStatusLoginCodeTimeout,
 			domain.ActivationStatusPINCodeTimeout:
 			err = m.finalizeProviderAction(ctx, activation, smsbower.SetStatusCancel)
@@ -1076,8 +1106,8 @@ func (m *Manager) activationExpired(activation domain.Activation) bool {
 	return activation.ProviderExpiresAt != nil && time.Now().UTC().After(*activation.ProviderExpiresAt)
 }
 
-func verificationCodeWaitTimedOut(sentAt, now time.Time) bool {
-	return !sentAt.IsZero() && now.After(sentAt.Add(verificationCodeWait))
+func verificationCodeWaitTimedOut(sentAt, now time.Time, wait time.Duration) bool {
+	return !sentAt.IsZero() && now.After(sentAt.Add(wait))
 }
 
 func (m *Manager) expireAndCancel(ctx context.Context, activation domain.Activation) error {
@@ -1205,6 +1235,15 @@ func (m *Manager) cancelAndClassifyFrom(
 }
 
 func (m *Manager) finalizeProviderAction(ctx context.Context, activation domain.Activation, action smsbower.SetStatus) error {
+	if repairedReason, repair := repairedProviderFinalizationReason(activation); repair {
+		_, err := m.store.TransitionActivationOwned(ctx, activation.ID,
+			[]domain.ActivationStatus{activation.Status}, activation.Status, repairedReason,
+			activation.LeaseOwner, activation.LeaseVersion)
+		if err != nil {
+			return err
+		}
+		activation.FailureReason = repairedReason
+	}
 	client, err := m.smsClient(ctx, activation.Provider)
 	if err != nil {
 		return err
@@ -1333,7 +1372,7 @@ func (m *Manager) pollLoginCode(ctx context.Context, activation domain.Activatio
 			_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPending, nil)
 			return err
 		}
-		if !verificationCodeWaitTimedOut(state.LoginCodeSentAt, now) {
+		if !verificationCodeWaitTimedOut(state.LoginCodeSentAt, now, loginVerificationCodeWait) {
 			return nil
 		}
 	}
@@ -1348,7 +1387,7 @@ func (m *Manager) pollLoginCode(ctx context.Context, activation domain.Activatio
 			return err
 		}
 	}
-	if !verificationCodeWaitTimedOut(state.LoginCodeSentAt, now) {
+	if !verificationCodeWaitTimedOut(state.LoginCodeSentAt, now, loginVerificationCodeWait) {
 		if received && status.Kind == smsbower.StatusOK {
 			return m.store.TouchActivationPoll(ctx, activation.ID, activation.LeaseOwner, now, now.Add(m.cfg.PollInterval))
 		}
@@ -1689,7 +1728,7 @@ func (m *Manager) pollPINCode(ctx context.Context, activation domain.Activation)
 			_, err = m.saveSession(ctx, activation.PhoneNumber, client.State(), targetPIN, domain.AccountStatusPINPending, activation.BalanceRP)
 			return err
 		}
-		if !verificationCodeWaitTimedOut(state.PINCodeSentAt, now) {
+		if !verificationCodeWaitTimedOut(state.PINCodeSentAt, now, pinVerificationCodeWait) {
 			return nil
 		}
 	}
@@ -1701,7 +1740,7 @@ func (m *Manager) pollPINCode(ctx context.Context, activation domain.Activation)
 			return err
 		}
 	}
-	if !verificationCodeWaitTimedOut(state.PINCodeSentAt, now) {
+	if !verificationCodeWaitTimedOut(state.PINCodeSentAt, now, pinVerificationCodeWait) {
 		if received && status.Kind == smsbower.StatusOK {
 			return m.store.TouchActivationPoll(ctx, activation.ID, activation.LeaseOwner, now, now.Add(m.cfg.PollInterval))
 		}

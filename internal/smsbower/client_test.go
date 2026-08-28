@@ -373,6 +373,9 @@ func TestProviderErrorsAndSetStatus(t *testing.T) {
 		if !IsAPIError(err, "NO_NUMBERS") {
 			t.Fatalf("error = %v, want NO_NUMBERS", err)
 		}
+		if got := err.Error(); !strings.HasPrefix(got, "smsbower getNumberV2: NO_NUMBERS") {
+			t.Fatalf("error text = %q, want default smsbower prefix", got)
+		}
 	})
 	t.Run("JSON error", func(t *testing.T) {
 		client, _ := testClient(t, func(url.Values) string {

@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+const MaxBatchQuantity = 100
+
 // Setting is a JSON-backed application setting. Keeping the value as JSON lets
 // callers evolve individual settings without requiring a database migration.
 type Setting struct {
@@ -38,10 +40,12 @@ type Batch struct {
 	ProxyTotal     int             `json:"proxy_total"`
 	NextPurchaseAt time.Time       `json:"next_purchase_at"`
 	Quantity       int             `json:"quantity"`
-	PurchasedCount int             `json:"purchased_count"`
+	// PurchasedCount is an audit counter for provider allocations persisted for
+	// this batch. Failed activations are replaced, so it may exceed Quantity.
+	PurchasedCount int `json:"purchased_count"`
 	// PurchaseReservedCount is a durable pre-provider-call quota reservation.
 	// Unknown provider outcomes retain this count so another instance cannot
-	// buy a replacement beyond Quantity.
+	// consume the same success slot twice.
 	PurchaseReservedCount int        `json:"purchase_reserved_count"`
 	FulfilledCount        int        `json:"fulfilled_count"`
 	InflightCount         int        `json:"inflight_count"`
@@ -57,6 +61,7 @@ type ActivationStatus string
 const (
 	ActivationStatusPurchased              ActivationStatus = "purchased"
 	ActivationStatusDuplicate              ActivationStatus = "duplicate"
+	ActivationStatusPhoneInUse             ActivationStatus = "phone_in_use"
 	ActivationStatusAwaitingLoginCode      ActivationStatus = "awaiting_login_code"
 	ActivationStatusLoggingIn              ActivationStatus = "logging_in"
 	ActivationStatusPINRequired            ActivationStatus = "pin_required"
@@ -141,16 +146,6 @@ type VerificationCode struct {
 	ProviderPayload    json.RawMessage   `json:"provider_payload,omitempty"`
 	ProviderReceivedAt *time.Time        `json:"provider_received_at,omitempty"`
 	CreatedAt          time.Time         `json:"created_at"`
-}
-
-type PhoneHistory struct {
-	PhoneFingerprint  string    `json:"phone_fingerprint"`
-	PhoneNumber       string    `json:"phone_number"`
-	FirstActivationID int64     `json:"first_activation_id"`
-	LastActivationID  int64     `json:"last_activation_id"`
-	TimesSeen         int       `json:"times_seen"`
-	FirstSeenAt       time.Time `json:"first_seen_at"`
-	LastSeenAt        time.Time `json:"last_seen_at"`
 }
 
 type AccountStatus string

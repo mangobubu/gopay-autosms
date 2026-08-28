@@ -25,7 +25,7 @@ const reserveBatchPurchaseSQL = `UPDATE batches SET
 		AND status IN ('pending','running')
 		AND purchase_protocol_version=1
 		AND purchase_reserved_count=0
-		AND purchased_count+purchase_reserved_count < quantity`
+		AND fulfilled_count+inflight_count+purchase_reserved_count < quantity`
 
 const releaseBatchPurchaseSQL = `UPDATE batches SET
 	purchase_reserved_count=purchase_reserved_count-1,
@@ -122,7 +122,8 @@ func (s *PostgresStore) CreateBatch(ctx context.Context, params CreateBatchParam
 	params.CountryCode = strings.TrimSpace(params.CountryCode)
 	params.Currency = strings.TrimSpace(params.Currency)
 	params.MaxPriceAmount = strings.TrimSpace(params.MaxPriceAmount)
-	if params.ServiceCode == "" || params.CountryCode == "" || params.MaxPriceAmount == "" || params.Quantity <= 0 {
+	if params.ServiceCode == "" || params.CountryCode == "" || params.MaxPriceAmount == "" ||
+		params.Quantity <= 0 || params.Quantity > domain.MaxBatchQuantity {
 		return domain.Batch{}, ErrInvalidInput
 	}
 	if len(params.TargetPINEnc) == 0 {
@@ -167,11 +168,11 @@ func (s *PostgresStore) ReserveBatchPurchase(ctx context.Context, batchID int64,
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var status string
-	var quantity, purchased, reserved, protocolVersion int
-	err = tx.QueryRow(ctx, `SELECT status, quantity, purchased_count,
-		purchase_reserved_count, purchase_protocol_version
+	var quantity, fulfilled, inflight, reserved, protocolVersion int
+	err = tx.QueryRow(ctx, `SELECT status, quantity, fulfilled_count,
+		inflight_count, purchase_reserved_count, purchase_protocol_version
 		FROM batches WHERE id=$1 FOR UPDATE`, batchID).
-		Scan(&status, &quantity, &purchased, &reserved, &protocolVersion)
+		Scan(&status, &quantity, &fulfilled, &inflight, &reserved, &protocolVersion)
 	if err != nil {
 		return mapError(err)
 	}
@@ -200,7 +201,7 @@ func (s *PostgresStore) ReserveBatchPurchase(ctx context.Context, batchID int64,
 		return ErrConflict
 	case reserved > 0:
 		return ErrPurchaseInProgress
-	case purchased+reserved >= quantity:
+	case fulfilled+inflight+reserved >= quantity:
 		return ErrBatchCapacity
 	}
 
@@ -757,6 +758,41 @@ func (s *PostgresStore) TransitionBatch(
 		return domain.Batch{}, mapError(err)
 	}
 	return domain.Batch{}, s.notFoundOrConflict(ctx, "batches", id)
+}
+
+func (s *PostgresStore) FailBatchForExhaustedProxies(
+	ctx context.Context,
+	id int64,
+	reason string,
+) (domain.Batch, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.Batch{}, fmt.Errorf("begin exhausted-proxy batch failure: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	batch, err := scanBatch(tx.QueryRow(ctx, `SELECT `+batchColumns+` FROM batches WHERE id=$1 FOR UPDATE`, id))
+	if err != nil {
+		return domain.Batch{}, mapError(err)
+	}
+	if batch.Status.Terminal() || batch.FulfilledCount >= batch.Quantity ||
+		batch.InflightCount != 0 || batch.PurchaseReservedCount != 0 ||
+		batch.ProxyTotal == 0 || batch.ProxyAvailable != 0 {
+		return domain.Batch{}, ErrConflict
+	}
+
+	failed, err := scanBatch(tx.QueryRow(ctx, `UPDATE batches SET
+		status='failed', failure_reason=$2,
+		finished_at=COALESCE(finished_at, now()), updated_at=now()
+		WHERE id=$1 AND status IN ('pending','running')
+		RETURNING `+batchColumns, id, reason))
+	if err != nil {
+		return domain.Batch{}, mapError(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return domain.Batch{}, fmt.Errorf("commit exhausted-proxy batch failure: %w", err)
+	}
+	return failed, nil
 }
 
 func (s *PostgresStore) CancelBatch(ctx context.Context, id int64) (domain.Batch, error) {

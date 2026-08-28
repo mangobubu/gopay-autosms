@@ -26,7 +26,7 @@ func TestLogin2FATimeoutRequestsAnotherSMSAndResendsGoPayOTP(t *testing.T) {
 	goPay := newVerificationResendGoPay(t, events)
 	defer goPay.Close()
 
-	oldSentAt := time.Now().UTC().Add(-verificationCodeWait - time.Second)
+	oldSentAt := time.Now().UTC().Add(-loginVerificationCodeWait - time.Second)
 	manager, store, box := newVerificationResendFlowManager(t, provider.URL, goPay.URL, gopay.Session{
 		Phone:            "81234567890",
 		CountryCode:      "+62",
@@ -98,7 +98,7 @@ func TestPINSetupTimeoutRequestsAnotherSMSAndResendsGoPayOTP(t *testing.T) {
 	goPay := newVerificationResendGoPay(t, events)
 	defer goPay.Close()
 
-	oldSentAt := time.Now().UTC().Add(-verificationCodeWait - time.Second)
+	oldSentAt := time.Now().UTC().Add(-pinVerificationCodeWait - time.Second)
 	manager, store, box := newVerificationResendFlowManager(t, provider.URL, goPay.URL, gopay.Session{
 		Phone:             "81234567890",
 		CountryCode:       "+62",
@@ -181,7 +181,7 @@ func TestReadyLogin2FAAndPINSetupConsumeLateCodeBeforeResend(t *testing.T) {
 			AccountID:        "account-1",
 			TwoFAToken:       "two-fa-token",
 			LoginStage:       gopay.LoginStageReady2FA,
-			LoginCodeSentAt:  time.Now().UTC().Add(-verificationCodeWait - time.Second),
+			LoginCodeSentAt:  time.Now().UTC().Add(-loginVerificationCodeWait - time.Second),
 			LoginCodeResends: 2,
 		}, domain.ActivationStatusAwaitingLoginCode)
 
@@ -227,7 +227,7 @@ func TestReadyLogin2FAAndPINSetupConsumeLateCodeBeforeResend(t *testing.T) {
 			PINVerificationID: "pin-verification-1",
 			PINOTPToken:       "pin-otp-token-1",
 			PINStage:          gopay.PINStageReadyCycle,
-			PINCodeSentAt:     time.Now().UTC().Add(-verificationCodeWait - time.Second),
+			PINCodeSentAt:     time.Now().UTC().Add(-pinVerificationCodeWait - time.Second),
 			PINCodeResends:    2,
 		}, domain.ActivationStatusAwaitingPINCode)
 
@@ -316,7 +316,7 @@ func TestVerificationResendFinalSaveFailureRecoversWithoutUncountedDispatch(t *t
 				return manager.pollLoginCode(ctx, activation)
 			},
 			age: func(state *gopay.Session) {
-				state.LoginCodeSentAt = time.Now().UTC().Add(-verificationCodeWait - time.Second)
+				state.LoginCodeSentAt = time.Now().UTC().Add(-loginVerificationCodeWait - time.Second)
 			},
 			stage: func(state gopay.Session) string { return string(state.LoginStage) },
 			count: func(state gopay.Session) int { return state.LoginCodeResends },
@@ -348,7 +348,7 @@ func TestVerificationResendFinalSaveFailureRecoversWithoutUncountedDispatch(t *t
 				return manager.pollPINCode(ctx, activation)
 			},
 			age: func(state *gopay.Session) {
-				state.PINCodeSentAt = time.Now().UTC().Add(-verificationCodeWait - time.Second)
+				state.PINCodeSentAt = time.Now().UTC().Add(-pinVerificationCodeWait - time.Second)
 			},
 			stage: func(state gopay.Session) string { return string(state.PINStage) },
 			count: func(state gopay.Session) int { return state.PINCodeResends },
@@ -519,7 +519,7 @@ func TestUncertainVerificationDispatchDoesNotConsumeCodeWithStaleToken(t *testin
 				return manager.pollLoginCode(ctx, activation)
 			},
 			age: func(state *gopay.Session) {
-				state.LoginCodeSentAt = time.Now().UTC().Add(-verificationCodeWait - time.Second)
+				state.LoginCodeSentAt = time.Now().UTC().Add(-loginVerificationCodeWait - time.Second)
 			},
 			stage:      func(state gopay.Session) string { return string(state.LoginStage) },
 			count:      func(state gopay.Session) int { return state.LoginCodeResends },
@@ -544,7 +544,7 @@ func TestUncertainVerificationDispatchDoesNotConsumeCodeWithStaleToken(t *testin
 				return manager.pollPINCode(ctx, activation)
 			},
 			age: func(state *gopay.Session) {
-				state.PINCodeSentAt = time.Now().UTC().Add(-verificationCodeWait - time.Second)
+				state.PINCodeSentAt = time.Now().UTC().Add(-pinVerificationCodeWait - time.Second)
 			},
 			stage:      func(state gopay.Session) string { return string(state.PINStage) },
 			count:      func(state gopay.Session) int { return state.PINCodeResends },
@@ -736,7 +736,7 @@ func TestVerificationCycleRecoversWhenProviderAdvancedBeforeLocalSave(t *testing
 		OTPToken:         "login-token-1",
 		Methods:          []string{"otp_sms"},
 		LoginStage:       gopay.LoginStageReady1FA,
-		LoginCodeSentAt:  time.Now().UTC().Add(-verificationCodeWait - time.Second),
+		LoginCodeSentAt:  time.Now().UTC().Add(-loginVerificationCodeWait - time.Second),
 		LoginCodeResends: 1,
 	}, domain.ActivationStatusAwaitingLoginCode)
 	failingStore := &verificationCycleAdvanceFailingStore{verificationResendFlowStore: store}
@@ -799,7 +799,7 @@ func TestVerificationCycleRetriesAcceptedCheckpointSave(t *testing.T) {
 		OTPToken:         "login-token-1",
 		Methods:          []string{"otp_sms"},
 		LoginStage:       gopay.LoginStageReady1FA,
-		LoginCodeSentAt:  time.Now().UTC().Add(-verificationCodeWait - time.Second),
+		LoginCodeSentAt:  time.Now().UTC().Add(-loginVerificationCodeWait - time.Second),
 		LoginCodeResends: 1,
 	}, domain.ActivationStatusAwaitingLoginCode)
 	failingStore := &verificationResendFailingStore{
@@ -849,7 +849,7 @@ func TestVerificationCycleRetriesRejectedCheckpointSave(t *testing.T) {
 		OTPToken:         "login-token-1",
 		Methods:          []string{"otp_sms"},
 		LoginStage:       gopay.LoginStageReady1FA,
-		LoginCodeSentAt:  time.Now().UTC().Add(-verificationCodeWait - time.Second),
+		LoginCodeSentAt:  time.Now().UTC().Add(-loginVerificationCodeWait - time.Second),
 		LoginCodeResends: 1,
 	}, domain.ActivationStatusAwaitingLoginCode)
 	failingStore := &verificationResendFailingStore{
@@ -903,7 +903,7 @@ func TestVerificationCycleDoesNotAdvanceOnFirstBadStatus(t *testing.T) {
 		OTPToken:         "login-token-1",
 		Methods:          []string{"otp_sms"},
 		LoginStage:       gopay.LoginStageReady1FA,
-		LoginCodeSentAt:  time.Now().UTC().Add(-verificationCodeWait - time.Second),
+		LoginCodeSentAt:  time.Now().UTC().Add(-loginVerificationCodeWait - time.Second),
 		LoginCodeResends: 1,
 	}, domain.ActivationStatusAwaitingLoginCode)
 
@@ -974,7 +974,7 @@ func TestVerificationCycleRecoversAmbiguousProviderResponse(t *testing.T) {
 				OTPToken:         "login-token-1",
 				Methods:          []string{"otp_sms"},
 				LoginStage:       gopay.LoginStageReady1FA,
-				LoginCodeSentAt:  time.Now().UTC().Add(-verificationCodeWait - time.Second),
+				LoginCodeSentAt:  time.Now().UTC().Add(-loginVerificationCodeWait - time.Second),
 				LoginCodeResends: 1,
 			}, domain.ActivationStatusAwaitingLoginCode)
 

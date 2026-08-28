@@ -21,13 +21,18 @@ const activationColumns = `id, batch_id, account_id, provider, provider_activati
 
 const providerActivationLockSQL = `SELECT pg_advisory_xact_lock(hashtextextended($1, 1))`
 
+// This lock protects only simultaneous use of the same phone. It does not
+// retain historical blacklist state: once the earlier activation has finished,
+// the same number is eligible again.
+const activePhoneLockSQL = `SELECT pg_advisory_xact_lock(hashtextextended($1, 2))`
+
+const activePhoneInUseSQL = `SELECT EXISTS(
+	SELECT 1 FROM activations
+	WHERE phone_fingerprint=$1 AND finished_at IS NULL
+)`
+
 const transitionStatusChangedAtSQL = `status_changed_at=CASE
 	WHEN status IS DISTINCT FROM $2 THEN clock_timestamp()
-	ELSE status_changed_at
-END`
-
-const duplicateStatusChangedAtSQL = `status_changed_at=CASE
-	WHEN status IS DISTINCT FROM 'duplicate' THEN clock_timestamp()
 	ELSE status_changed_at
 END`
 
@@ -40,30 +45,34 @@ const recordBatchPurchaseSQL = `UPDATE batches SET
 	updated_at=now()
 	WHERE id=$1
 		AND purchase_reserved_count > 0
-		AND purchased_count < quantity`
+		AND fulfilled_count+inflight_count+purchase_reserved_count <= quantity`
 
-// This predicate is evaluated against the counters before the current slot is
-// released. An inflight count of one therefore means the current unsuccessful
-// activation is the last purchased number still being processed.
+// Kept for migration 7 only. That historical migration converged batches made
+// by the old purchased-count quota implementation and must not be rewritten.
 const allPurchasedActivationsFailedReason = "计划购买数量内的号码均处理失败，任务已自动停止"
-
-const allPurchasedActivationsFailedSQL = `NOT $2::boolean
-	AND status IN ('pending','running')
-	AND purchased_count >= quantity
-	AND purchase_reserved_count=0
-	AND fulfilled_count=0
-	AND inflight_count=1`
 
 const releaseBatchSlotSQL = `UPDATE batches SET
 	fulfilled_count=fulfilled_count+CASE WHEN $2::boolean THEN 1 ELSE 0 END,
 	inflight_count=GREATEST(inflight_count-1, 0),
-	status=CASE WHEN ` + allPurchasedActivationsFailedSQL + ` THEN 'failed' ELSE status END,
-	failure_reason=CASE WHEN ` + allPurchasedActivationsFailedSQL + `
-		THEN '` + allPurchasedActivationsFailedReason + `' ELSE failure_reason END,
-	finished_at=CASE WHEN ` + allPurchasedActivationsFailedSQL + `
-		THEN COALESCE(finished_at, now()) ELSE finished_at END,
+	status=CASE
+		WHEN $2::boolean AND status IN ('pending','running') AND fulfilled_count+1 >= quantity
+			THEN 'completed'
+		ELSE status
+	END,
+	failure_reason=CASE
+		WHEN $2::boolean AND status IN ('pending','running') AND fulfilled_count+1 >= quantity
+			THEN ''
+		ELSE failure_reason
+	END,
+	finished_at=CASE
+		WHEN $2::boolean AND status IN ('pending','running') AND fulfilled_count+1 >= quantity
+			THEN COALESCE(finished_at, now())
+		ELSE finished_at
+	END,
 	updated_at=now()
-	WHERE id=$1 AND (NOT $2::boolean OR fulfilled_count < quantity)`
+	WHERE id=$1
+		AND inflight_count > 0
+		AND (NOT $2::boolean OR fulfilled_count < quantity)`
 
 func lockProviderActivation(ctx context.Context, tx pgx.Tx, provider, providerID string) error {
 	// Use a length-prefixed key and a namespace seed distinct from phone
@@ -160,11 +169,11 @@ func (s *PostgresStore) CreateActivationAtomically(
 
 	// Every quota-changing transaction locks the batch before its attempt or
 	// activation rows. This matches cancellation and worker finalization.
-	var quantity, purchased, reserved int
+	var quantity, fulfilled, inflight, reserved int
 	var batchStatus string
-	err = tx.QueryRow(ctx, `SELECT quantity, purchased_count, purchase_reserved_count, status
+	err = tx.QueryRow(ctx, `SELECT quantity, fulfilled_count, inflight_count, purchase_reserved_count, status
 		FROM batches WHERE id=$1 FOR UPDATE`, params.BatchID).
-		Scan(&quantity, &purchased, &reserved, &batchStatus)
+		Scan(&quantity, &fulfilled, &inflight, &reserved, &batchStatus)
 	if err != nil {
 		return CreateActivationResult{}, mapError(err)
 	}
@@ -200,12 +209,12 @@ func (s *PostgresStore) CreateActivationAtomically(
 		if err = tx.Commit(ctx); err != nil {
 			return CreateActivationResult{}, fmt.Errorf("%w: commit idempotent activation: %v", ErrCommitUnknown, err)
 		}
-		return CreateActivationResult{Activation: existing, Duplicate: existing.Status == domain.ActivationStatusDuplicate}, nil
+		return CreateActivationResult{Activation: existing}, nil
 	}
 	if attemptState != string(PurchaseAttemptSent) {
 		return CreateActivationResult{}, ErrConflict
 	}
-	if purchased >= quantity || reserved <= 0 {
+	if reserved <= 0 || fulfilled+inflight+reserved > quantity {
 		return CreateActivationResult{}, ErrBatchCapacity
 	}
 	if err = lockProviderActivation(ctx, tx, params.Provider, params.ProviderActivationID); err != nil {
@@ -221,13 +230,19 @@ func (s *PostgresStore) CreateActivationAtomically(
 	} else if scanErr != pgx.ErrNoRows {
 		return CreateActivationResult{}, mapError(scanErr)
 	}
-	// Serialize all inserts for a phone fingerprint. PostgreSQL uniqueness alone
-	// prevents two history rows, but an advisory lock also makes the winner and
-	// duplicate activation deterministic without transient FK/update races.
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, fingerprint); err != nil {
+	if _, err = tx.Exec(ctx, activePhoneLockSQL, fingerprint); err != nil {
 		return CreateActivationResult{}, mapError(err)
 	}
-
+	var phoneInUse bool
+	if err = tx.QueryRow(ctx, activePhoneInUseSQL, fingerprint).Scan(&phoneInUse); err != nil {
+		return CreateActivationResult{}, mapError(err)
+	}
+	activationStatus := domain.ActivationStatusPurchased
+	failureReason := ""
+	if phoneInUse {
+		activationStatus = domain.ActivationStatusPhoneInUse
+		failureReason = "该号码当前仍有未结束任务，已自动取消本次分配"
+	}
 	controlAction := string(domain.ControlActionNone)
 	var hiddenAt *time.Time
 	if domain.BatchStatus(batchStatus).Terminal() {
@@ -238,15 +253,16 @@ func (s *PostgresStore) CreateActivationAtomically(
 	insertQuery := `INSERT INTO activations(
 		batch_id, provider, provider_activation_id, phone_number, phone_fingerprint,
 		service_code, country_code, operator, purchase_price_amount, currency,
-		status, slot_reserved, provider_payload, provider_expires_at, next_run_at,
+		status, failure_reason, slot_reserved, provider_payload, provider_expires_at, next_run_at,
 		control_action, hidden_at
-	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'purchased',true,$11::jsonb,$12,$13,$14,$15)
+	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,true,$13::jsonb,$14,$15,$16,$17)
 	ON CONFLICT(provider, provider_activation_id) DO NOTHING
 	RETURNING ` + activationColumns
 	activation, err := scanActivation(tx.QueryRow(ctx, insertQuery,
 		params.BatchID, params.Provider, params.ProviderActivationID, normalized, fingerprint,
 		params.ServiceCode, params.CountryCode, params.Operator, params.PurchasePriceAmount,
-		params.Currency, payload, params.ProviderExpiresAt, params.NextRunAt, controlAction, hiddenAt,
+		params.Currency, string(activationStatus), failureReason, payload, params.ProviderExpiresAt,
+		params.NextRunAt, controlAction, hiddenAt,
 	))
 	if err == pgx.ErrNoRows {
 		return CreateActivationResult{}, ErrConflict
@@ -255,30 +271,6 @@ func (s *PostgresStore) CreateActivationAtomically(
 		return CreateActivationResult{}, mapError(err)
 	}
 
-	result, err := tx.Exec(ctx, `INSERT INTO phone_history(
-		phone_fingerprint, phone_number, first_activation_id, last_activation_id
-	) VALUES($1,$2,$3,$3) ON CONFLICT(phone_fingerprint) DO NOTHING`,
-		fingerprint, normalized, activation.ID,
-	)
-	if err != nil {
-		return CreateActivationResult{}, mapError(err)
-	}
-	duplicate := result.RowsAffected() == 0
-	if duplicate {
-		if _, err = tx.Exec(ctx, `UPDATE phone_history SET
-			phone_number=$2, last_activation_id=$3, times_seen=times_seen+1, last_seen_at=now()
-			WHERE phone_fingerprint=$1`, fingerprint, normalized, activation.ID); err != nil {
-			return CreateActivationResult{}, mapError(err)
-		}
-		activation, err = scanActivation(tx.QueryRow(ctx, `UPDATE activations SET
-			status='duplicate',
-			`+duplicateStatusChangedAtSQL+`,
-			failure_reason='historical phone number', next_run_at=now(), updated_at=now()
-			WHERE id=$1 RETURNING `+activationColumns, activation.ID))
-		if err != nil {
-			return CreateActivationResult{}, mapError(err)
-		}
-	}
 	attemptResult, err := tx.Exec(ctx, `UPDATE batch_purchase_attempts SET
 		state='committed', provider=$2, provider_activation_id=$3,
 		activation_id=$4, failure_reason='', decided_at=now()
@@ -290,7 +282,7 @@ func (s *PostgresStore) CreateActivationAtomically(
 	if attemptResult.RowsAffected() == 0 {
 		return CreateActivationResult{}, ErrConflict
 	}
-	result, err = tx.Exec(ctx, recordBatchPurchaseSQL, params.BatchID)
+	result, err := tx.Exec(ctx, recordBatchPurchaseSQL, params.BatchID)
 	if err != nil {
 		return CreateActivationResult{}, mapError(err)
 	}
@@ -300,7 +292,7 @@ func (s *PostgresStore) CreateActivationAtomically(
 	if err = tx.Commit(ctx); err != nil {
 		return CreateActivationResult{}, fmt.Errorf("%w: %v", ErrCommitUnknown, err)
 	}
-	return CreateActivationResult{Activation: activation, Duplicate: duplicate}, nil
+	return CreateActivationResult{Activation: activation}, nil
 }
 
 func (s *PostgresStore) GetActivation(ctx context.Context, id int64) (domain.Activation, error) {
@@ -374,7 +366,10 @@ func buildActivationListQuery(filter ActivationFilter) (string, []any) {
 	}
 	limitPlaceholder := addArg(page.Limit)
 	offsetPlaceholder := addArg(page.Offset)
-	query += ` ORDER BY created_at DESC, id DESC LIMIT ` + limitPlaceholder + ` OFFSET ` + offsetPlaceholder
+	// Keep successful numbers at the top. Within each group, unfinished rows
+	// precede historical failures so an unusually long replacement run cannot
+	// push a still-actionable activation past the dashboard page limit.
+	query += ` ORDER BY (ever_fulfilled OR status='success') DESC, (finished_at IS NULL) DESC, status_changed_at DESC, created_at DESC, id DESC LIMIT ` + limitPlaceholder + ` OFFSET ` + offsetPlaceholder
 	return query, args
 }
 
@@ -892,23 +887,4 @@ func (s *PostgresStore) HideActivation(ctx context.Context, id int64) error {
 		return ErrNotFound
 	}
 	return nil
-}
-
-func (s *PostgresStore) GetPhoneHistory(ctx context.Context, phone string) (domain.PhoneHistory, error) {
-	normalized, err := domain.NormalizePhone(phone)
-	if err != nil {
-		return domain.PhoneHistory{}, ErrInvalidInput
-	}
-	fingerprint := domain.PhoneFingerprint(normalized)
-	var history domain.PhoneHistory
-	err = s.pool.QueryRow(ctx, `SELECT phone_fingerprint, phone_number,
-		first_activation_id, last_activation_id, times_seen, first_seen_at, last_seen_at
-		FROM phone_history WHERE phone_fingerprint=$1`, fingerprint).Scan(
-		&history.PhoneFingerprint, &history.PhoneNumber, &history.FirstActivationID,
-		&history.LastActivationID, &history.TimesSeen, &history.FirstSeenAt, &history.LastSeenAt,
-	)
-	if err != nil {
-		return domain.PhoneHistory{}, mapError(err)
-	}
-	return history, nil
 }

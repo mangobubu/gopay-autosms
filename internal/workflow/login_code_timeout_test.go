@@ -179,21 +179,24 @@ func TestProcessActivationFinalizesClassifiedLoginCodeTimeout(t *testing.T) {
 	}
 }
 
-func TestVerificationCodeWaitTimedOutUsesStrictSixtySecondBoundary(t *testing.T) {
+func TestVerificationCodeWaitTimedOutUsesStrictConfiguredBoundary(t *testing.T) {
 	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
 		name         string
+		wait         time.Duration
 		sentAt       time.Time
 		wantTimedOut bool
 	}{
-		{name: "over 60 seconds", sentAt: now.Add(-verificationCodeWait - time.Nanosecond), wantTimedOut: true},
-		{name: "exactly 60 seconds", sentAt: now.Add(-verificationCodeWait)},
-		{name: "under 60 seconds", sentAt: now.Add(-verificationCodeWait + time.Nanosecond)},
-		{name: "zero persisted time"},
+		{name: "login over 60 seconds", wait: loginVerificationCodeWait, sentAt: now.Add(-loginVerificationCodeWait - time.Nanosecond), wantTimedOut: true},
+		{name: "login exactly 60 seconds", wait: loginVerificationCodeWait, sentAt: now.Add(-loginVerificationCodeWait)},
+		{name: "PIN over 80 seconds", wait: pinVerificationCodeWait, sentAt: now.Add(-pinVerificationCodeWait - time.Nanosecond), wantTimedOut: true},
+		{name: "PIN exactly 80 seconds", wait: pinVerificationCodeWait, sentAt: now.Add(-pinVerificationCodeWait)},
+		{name: "PIN under 80 seconds", wait: pinVerificationCodeWait, sentAt: now.Add(-pinVerificationCodeWait + time.Nanosecond)},
+		{name: "zero persisted time", wait: pinVerificationCodeWait},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := verificationCodeWaitTimedOut(test.sentAt, now); got != test.wantTimedOut {
+			if got := verificationCodeWaitTimedOut(test.sentAt, now, test.wait); got != test.wantTimedOut {
 				t.Fatalf("verificationCodeWaitTimedOut() = %v, want %v", got, test.wantTimedOut)
 			}
 		})

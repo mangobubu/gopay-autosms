@@ -7,6 +7,7 @@ export interface ActivationExpiryPresentation {
 
 const PROVIDER_CANCELLED_CLASSIFICATIONS = new Set([
   'duplicate',
+  'phone_in_use',
   'login_code_timeout',
   'pin_code_timeout',
   'pin_required',

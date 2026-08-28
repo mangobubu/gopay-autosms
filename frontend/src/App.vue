@@ -5,6 +5,7 @@ import type { FormInstance, FormRules } from 'element-plus'
 
 import { api, ApiError } from './api'
 import { matchesCatalogOption } from './catalogSearch'
+import ActivationCard from './components/ActivationCard.vue'
 import ActivationTable from './components/ActivationTable.vue'
 import {
   findAccountLoginStatusByPhone,
@@ -14,6 +15,7 @@ import { findRefreshedPrice } from './priceOptions'
 import { SMS_PROVIDERS, smsProviderProfile } from './smsProviders'
 import {
   batchStatus,
+  isSuccessfulActivation,
   normalizeAccountLoginStatuses,
   normalizeActivations,
   normalizeBatch,
@@ -176,6 +178,10 @@ const currentBatchActive = computed(() => Boolean(currentBatch.value && currentB
 const canStopCurrentBatch = computed(() => (
   currentBatch.value?.status === 'pending' || currentBatch.value?.status === 'running'
 ))
+const successfulActivations = computed(() => activations.value.filter(isSuccessfulActivation))
+const remainingActivations = computed(() => (
+  activations.value.filter((item) => !isSuccessfulActivation(item))
+))
 const unsuccessfulCount = computed(() => {
   const batch = currentBatch.value
   if (!batch) return 0
@@ -184,7 +190,7 @@ const unsuccessfulCount = computed(() => {
 const batchProgress = computed(() => {
   const batch = currentBatch.value
   if (!batch || batch.total < 1) return 0
-  return Math.min(100, Math.round((batch.purchased / batch.total) * 100))
+  return Math.min(100, Math.round((batch.successful / batch.total) * 100))
 })
 
 function snapshotPrice(item: PriceOption): ClientPriceSnapshot {
@@ -778,51 +784,29 @@ async function refreshDashboard(silent = true): Promise<void> {
   const requestGeneration = dashboardGeneration
 
   try {
-    const requests: Promise<unknown>[] = []
-    if (requestBatchId) requests.push(api.getBatch(requestBatchId))
-    requests.push(api.getActivations(requestBatchId || undefined))
-    const results = await Promise.allSettled(requests)
+    // The batch detail response already includes its activation views. Avoid a
+    // second 500-row request (and a second verification-code lookup per row)
+    // on every two-second refresh.
+    const payload = requestBatchId
+      ? await api.getBatch(requestBatchId)
+      : await api.getActivations()
     if (requestGeneration !== dashboardGeneration || requestBatchId !== currentBatchId.value) return
 
-    let activationPayload: unknown
-    let batchPayload: unknown
-    let partialError: unknown
     if (requestBatchId) {
-      const batchResult = results[0]
-      const activationResult = results[1]
-      if (batchResult?.status === 'fulfilled') {
-        batchPayload = batchResult.value
-        currentBatch.value = normalizeBatch(batchResult.value)
-      } else if (batchResult?.status === 'rejected') {
-        if (batchResult.reason instanceof ApiError && batchResult.reason.status === 404) {
-          dashboardGeneration += 1
-          currentBatchId.value = ''
-          currentBatch.value = null
-          activations.value = []
-          safeRemoveItem(localStorageAccess, ACTIVE_BATCH_KEY)
-          return
-        } else {
-          partialError = batchResult.reason
-        }
-      }
-      if (activationResult?.status === 'fulfilled') activationPayload = activationResult.value
-      if (activationResult?.status === 'rejected' && batchPayload !== undefined) {
-        activationPayload = batchPayload
-      }
-      if (batchResult?.status === 'rejected' && activationResult?.status === 'rejected') {
-        throw batchResult.reason
-      }
-    } else {
-      const activationResult = results[0]
-      if (activationResult?.status === 'fulfilled') activationPayload = activationResult.value
-      else if (activationResult?.status === 'rejected') throw activationResult.reason
+      currentBatch.value = normalizeBatch(payload)
     }
-
-    if (activationPayload !== undefined) activations.value = normalizeActivations(activationPayload)
-    if (partialError) throw partialError
+    activations.value = normalizeActivations(payload)
     connectionError.value = ''
   } catch (error) {
     if (requestGeneration !== dashboardGeneration || requestBatchId !== currentBatchId.value) return
+    if (requestBatchId && error instanceof ApiError && error.status === 404) {
+      dashboardGeneration += 1
+      currentBatchId.value = ''
+      currentBatch.value = null
+      activations.value = []
+      safeRemoveItem(localStorageAccess, ACTIVE_BATCH_KEY)
+      return
+    }
     connectionError.value = friendlyError(error)
     if (!silent) ElMessage.error(connectionError.value)
   } finally {
@@ -936,7 +920,7 @@ async function markSuccess(activation: ActivationView): Promise<void> {
 async function deleteActivation(activation: ActivationView): Promise<void> {
   try {
     await ElMessageBox.confirm(
-      `删除号码 ${activation.phone}？系统会取消该号码，并保留历史去重记录。`,
+      `删除号码 ${activation.phone}？系统会取消该号码并从列表移除。`,
       '确认删除',
       {
         confirmButtonText: '删除号码',
@@ -1048,6 +1032,28 @@ onBeforeUnmount(() => {
           请检查服务状态或 {{ currentSMSProviderProfile.displayName }} 配置，页面会在后台继续尝试连接。
         </template>
       </el-alert>
+
+      <section v-if="successfulActivations.length" class="successful-rail" aria-labelledby="successful-rail-title">
+        <header class="successful-rail__head">
+          <div>
+            <h2 id="successful-rail-title">成功号码</h2>
+            <small>完整号码与任务信息集中显示</small>
+          </div>
+          <span>当前显示 {{ successfulActivations.length }} 个成功号码</span>
+        </header>
+        <div class="successful-rail__track">
+          <ActivationCard
+            v-for="activation in successfulActivations"
+            :key="activation.id"
+            :activation="activation"
+            :login-status="loginStatusForActivation(activation)"
+            :busy="actionBusy[activation.id]"
+            :now-ms="countdownNow"
+            @success="markSuccess"
+            @delete="deleteActivation"
+          />
+        </div>
+      </section>
 
       <section class="control-grid">
         <el-card class="panel settings-panel" shadow="never" v-loading="settingsLoading">
@@ -1231,7 +1237,7 @@ onBeforeUnmount(() => {
               <el-form-item label="计划购买数量" prop="quantity">
                 <el-input-number v-model="form.quantity" :min="1" :max="100" controls-position="right" />
                 <div class="field-hint">
-                  每成功购买一个号码即计入数量；号码后续处理未成功时也不会自动补购。
+                  仅成功完成的号码计入数量；失败时会自动补购，直到成功数达到计划数量。
                 </div>
               </el-form-item>
               <el-form-item label="设置 PIN" prop="pin">
@@ -1366,14 +1372,14 @@ onBeforeUnmount(() => {
             <h2>号码与验证码</h2>
           </div>
           <div class="section-heading__actions">
-            <span>{{ activations.length }} 条记录</span>
+            <span>{{ remainingActivations.length }} 条其他记录</span>
             <el-button :loading="refreshing" plain @click="refreshDashboard(false)">立即刷新</el-button>
           </div>
         </div>
 
         <ActivationTable
-          v-if="activations.length"
-          :activations="activations"
+          v-if="remainingActivations.length"
+          :activations="remainingActivations"
           :busy-by-id="actionBusy"
           :get-login-status="loginStatusForActivation"
           :now-ms="countdownNow"
@@ -1384,7 +1390,7 @@ onBeforeUnmount(() => {
         <el-empty
           v-else
           class="activation-empty"
-          description="暂无号码记录，配置参数后启动第一个任务"
+          :description="successfulActivations.length ? '暂无其他号码记录' : '暂无号码记录，配置参数后启动第一个任务'"
           :image-size="92"
         />
       </section>

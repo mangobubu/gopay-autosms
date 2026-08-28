@@ -58,7 +58,7 @@ func (s *purchaseReservationStore) ReserveBatchPurchase(_ context.Context, batch
 	if s.reservedToken != "" {
 		return storage.ErrPurchaseInProgress
 	}
-	if s.batch.PurchasedCount+s.batch.PurchaseReservedCount >= s.batch.Quantity {
+	if s.batch.FulfilledCount+s.batch.InflightCount+s.batch.PurchaseReservedCount >= s.batch.Quantity {
 		return storage.ErrBatchCapacity
 	}
 	s.reservedToken = token
@@ -190,6 +190,7 @@ func (s *purchaseReservationStore) CreateActivationAtomically(
 	}
 	s.activationCreates++
 	s.batch.PurchasedCount++
+	s.batch.InflightCount++
 	s.batch.PurchaseReservedCount--
 	s.reservedToken = ""
 	s.attemptState = storage.PurchaseAttemptCommitted

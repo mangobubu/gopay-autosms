@@ -245,7 +245,7 @@ type createBatchRequest struct {
 	SMSProvider  string  `json:"sms_provider"`
 	Source       string  `json:"source"`
 	ProviderIDs  []int64 `json:"provider_ids"`
-	Quantity     int     `json:"quantity" binding:"required,min=1"`
+	Quantity     int     `json:"quantity" binding:"required,min=1,max=100"`
 	PIN          string  `json:"pin" binding:"required"`
 	Proxy        string  `json:"proxy"`
 	ProxyPool    string  `json:"proxy_pool"`

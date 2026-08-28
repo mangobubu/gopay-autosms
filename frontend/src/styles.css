@@ -234,6 +234,69 @@ textarea {
   margin-bottom: 20px;
 }
 
+.successful-rail {
+  overflow: hidden;
+  margin-bottom: 20px;
+  border: 1px solid #9cbcf3;
+  border-radius: 18px;
+  background: linear-gradient(102deg, #edf5ff 0%, #f8fbff 48%, #eefcf7 100%);
+  box-shadow: 0 12px 34px rgba(37, 99, 235, 0.12);
+}
+
+.successful-rail__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 16px;
+  color: #31517e;
+  border-bottom: 1px solid rgba(110, 151, 218, 0.24);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.successful-rail__head > div {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.successful-rail__head h2 {
+  margin: 0;
+  color: #23456f;
+  font-size: 14px;
+}
+
+.successful-rail__head small {
+  color: #7186a5;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.successful-rail__head > span {
+  flex: none;
+}
+
+.successful-rail__track {
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 12px;
+  scroll-padding-inline: 12px;
+  scroll-snap-type: x proximity;
+  scrollbar-color: rgba(72, 111, 169, 0.38) transparent;
+  scrollbar-width: thin;
+}
+
+.successful-rail__track > .activation-card {
+  flex: 0 0 clamp(390px, 42vw, 560px);
+  scroll-snap-align: start;
+  box-shadow: 0 6px 18px rgba(37, 99, 235, 0.08);
+}
+
 .control-grid {
   display: grid;
   grid-template-columns: minmax(290px, 0.7fr) minmax(620px, 1.65fr);
@@ -954,6 +1017,10 @@ textarea {
   .activation-grid {
     grid-template-columns: 1fr;
   }
+
+  .successful-rail__track > .activation-card {
+    flex-basis: clamp(390px, 70vw, 560px);
+  }
 }
 
 @media (max-width: 760px) {
@@ -983,6 +1050,22 @@ textarea {
 
   .poll-indicator {
     align-self: stretch;
+  }
+
+  .successful-rail__head > div {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .successful-rail__track {
+    padding: 10px;
+    scroll-padding-inline: 10px;
+  }
+
+  .successful-rail__track > .activation-card {
+    min-width: 0;
+    flex-basis: calc(100vw - 50px);
   }
 
   .settings-panel .el-form,

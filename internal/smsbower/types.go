@@ -164,12 +164,15 @@ type SetStatusResult struct {
 }
 
 // APIError reports an error returned in either the legacy text response or a
-// JSON response. Code is stable enough for errors.Is-style application logic.
+// JSON response. Provider optionally overrides the display label; an empty
+// value preserves the default SMSBower label. Code is stable enough for
+// errors.Is-style application logic.
 type APIError struct {
-	Action  string
-	Code    string
-	Message string
-	Raw     string
+	Provider string
+	Action   string
+	Code     string
+	Message  string
+	Raw      string
 }
 
 // PurchaseUnknownError wraps an ambiguous purchase outcome. It is returned
@@ -197,11 +200,15 @@ func (e *APIError) Error() string {
 	if e == nil {
 		return ""
 	}
+	provider := strings.TrimSpace(e.Provider)
+	if provider == "" {
+		provider = "smsbower"
+	}
 	message := strings.TrimSpace(e.Message)
 	if message == "" || strings.EqualFold(message, e.Code) {
-		return fmt.Sprintf("smsbower %s: %s", e.Action, e.Code)
+		return fmt.Sprintf("%s %s: %s", provider, e.Action, e.Code)
 	}
-	return fmt.Sprintf("smsbower %s: %s: %s", e.Action, e.Code, message)
+	return fmt.Sprintf("%s %s: %s: %s", provider, e.Action, e.Code, message)
 }
 
 // IsAPIError reports whether err (including a wrapped/joined error) contains

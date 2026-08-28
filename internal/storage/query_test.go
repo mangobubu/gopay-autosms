@@ -31,6 +31,7 @@ func TestBuildActivationListQuery(t *testing.T) {
 		"status=ANY($2::text[])",
 		"hidden_at IS NULL",
 		"phone_number ILIKE $3",
+		"ORDER BY (ever_fulfilled OR status='success') DESC, (finished_at IS NULL) DESC, status_changed_at DESC, created_at DESC, id DESC",
 		"LIMIT $4 OFFSET $5",
 	} {
 		if !strings.Contains(query, expected) {
@@ -49,7 +50,23 @@ func TestBuildActivationListQueryCanIncludeHidden(t *testing.T) {
 	}
 }
 
-func TestMigrationHasAtomicDedupAndRestartIndexes(t *testing.T) {
+func TestActivePhoneProtectionDoesNotRestoreHistoricalBlacklist(t *testing.T) {
+	if !strings.Contains(activePhoneLockSQL, "pg_advisory_xact_lock") {
+		t.Fatalf("active phone insertion is not serialized: %s", activePhoneLockSQL)
+	}
+	for _, required := range []string{"phone_fingerprint=$1", "finished_at IS NULL"} {
+		if !strings.Contains(activePhoneInUseSQL, required) {
+			t.Fatalf("active phone predicate missing %q: %s", required, activePhoneInUseSQL)
+		}
+	}
+	for _, forbidden := range []string{"phone_history", "hidden_at IS NULL"} {
+		if strings.Contains(activePhoneInUseSQL, forbidden) {
+			t.Fatalf("active phone predicate restores blacklist semantics (%q): %s", forbidden, activePhoneInUseSQL)
+		}
+	}
+}
+
+func TestMigrationHasActivationAndRestartIndexes(t *testing.T) {
 	var all strings.Builder
 	for _, migration := range migrations {
 		for _, statement := range migration.statements {
@@ -59,7 +76,7 @@ func TestMigrationHasAtomicDedupAndRestartIndexes(t *testing.T) {
 	}
 	schema := all.String()
 	for _, required := range []string{
-		"phone_fingerprint char(64) PRIMARY KEY",
+		"phone_fingerprint char(64) NOT NULL",
 		"UNIQUE (activation_id, cycle_no)",
 		"activations_runnable_idx",
 		"hidden_at timestamptz",
@@ -107,7 +124,6 @@ func TestStatusChangedAtMigrationAndTransitionPreserveStateEntryTime(t *testing.
 	}
 	for name, sql := range map[string]string{
 		"generic transition": transitionStatusChangedAtSQL,
-		"duplicate write":    duplicateStatusChangedAtSQL,
 	} {
 		if !strings.Contains(sql, "IS DISTINCT FROM") ||
 			!strings.Contains(sql, "THEN clock_timestamp()") ||
@@ -141,6 +157,78 @@ func TestAllFailedBatchMigrationConvergesExistingActiveBatches(t *testing.T) {
 	} {
 		if !strings.Contains(sql, required) {
 			t.Fatalf("all-failed batch migration missing %q: %s", required, sql)
+		}
+	}
+}
+
+func TestUnregisteredConflictMigrationRepairsOnlyExactLegacyReason(t *testing.T) {
+	var migrationSQL strings.Builder
+	for _, migration := range migrations {
+		if migration.version != 8 {
+			continue
+		}
+		for _, statement := range migration.statements {
+			migrationSQL.WriteString(statement)
+			migrationSQL.WriteByte('\n')
+		}
+	}
+	sql := migrationSQL.String()
+	for _, required := range []string{
+		"UPDATE activations SET",
+		"failure_reason='未注册'",
+		"updated_at=now()",
+		"WHERE status='unregistered'",
+		"failure_reason ~*",
+		"^[[:space:]]*(smsbower|herosms)",
+		"setstatus[[:space:]]*:[[:space:]]*http_409",
+		"conflict[[:space:]]*$",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("unregistered-conflict migration missing %q: %s", required, sql)
+		}
+	}
+	for _, forbidden := range []string{
+		"finished_at IS NULL",
+		"status IN",
+		"LIKE",
+		"ILIKE",
+	} {
+		if strings.Contains(sql, forbidden) {
+			t.Fatalf("unregistered-conflict migration is broader than the legacy shape (%q): %s", forbidden, sql)
+		}
+	}
+}
+
+func TestSuccessTargetMigrationReplacesPurchaseLimitAndDropsPhoneBlacklist(t *testing.T) {
+	var migrationSQL strings.Builder
+	for _, migration := range migrations {
+		if migration.version != 9 {
+			continue
+		}
+		for _, statement := range migration.statements {
+			migrationSQL.WriteString(statement)
+			migrationSQL.WriteByte('\n')
+		}
+	}
+	sql := migrationSQL.String()
+	for _, required := range []string{
+		"DROP CONSTRAINT IF EXISTS batches_active_purchase_capacity_chk",
+		"ADD CONSTRAINT batches_success_slot_capacity_chk",
+		"fulfilled_count+inflight_count+purchase_reserved_count <= quantity",
+		"DROP TABLE IF EXISTS phone_history",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("success-target migration missing %q: %s", required, sql)
+		}
+	}
+	for _, forbidden := range []string{
+		"purchased_count+purchase_reserved_count <= quantity",
+		"status='running'",
+		"status='pending'",
+		"finished_at=NULL",
+	} {
+		if strings.Contains(sql, forbidden) {
+			t.Fatalf("success-target migration changes historical task state or retains the old limit (%q): %s", forbidden, sql)
 		}
 	}
 }
@@ -215,7 +303,7 @@ func TestPurchaseTokenSQLMaintainsQuotaInvariant(t *testing.T) {
 	for _, required := range []string{
 		"purchase_reserved_count=purchase_reserved_count+1",
 		"purchase_reserved_count=0",
-		"purchased_count+purchase_reserved_count < quantity",
+		"fulfilled_count+inflight_count+purchase_reserved_count < quantity",
 	} {
 		if !strings.Contains(reserveBatchPurchaseSQL, required) {
 			t.Fatalf("purchase reservation SQL missing %q: %s", required, reserveBatchPurchaseSQL)
@@ -235,6 +323,7 @@ func TestPurchaseTokenSQLMaintainsQuotaInvariant(t *testing.T) {
 	for _, required := range []string{
 		"purchased_count=purchased_count+1",
 		"inflight_count=inflight_count+1",
+		"fulfilled_count+inflight_count+purchase_reserved_count <= quantity",
 		"status=CASE WHEN status IN ('pending','running') THEN 'running' ELSE status END",
 	} {
 		if !strings.Contains(recordBatchPurchaseSQL, required) {
@@ -292,9 +381,9 @@ func TestFreezeConflictSQLDoesNotClaimExistingProviderIdentity(t *testing.T) {
 	}
 }
 
-func TestPurchaseAccountingSQLStopsWhenEveryPlannedNumberFails(t *testing.T) {
+func TestPurchaseAccountingSQLRefillsFailuresAndCompletesAtSuccessTarget(t *testing.T) {
 	if !strings.Contains(recordBatchPurchaseSQL, "status=CASE WHEN status IN ('pending','running') THEN 'running' ELSE status END") {
-		t.Fatalf("recording the last purchase must keep the batch running: %s", recordBatchPurchaseSQL)
+		t.Fatalf("recording a purchase must keep the batch running: %s", recordBatchPurchaseSQL)
 	}
 	if strings.Contains(recordBatchPurchaseSQL, "'completed'") || strings.Contains(recordBatchPurchaseSQL, "finished_at") {
 		t.Fatalf("recording a purchase must not complete the batch: %s", recordBatchPurchaseSQL)
@@ -308,28 +397,20 @@ func TestPurchaseAccountingSQLStopsWhenEveryPlannedNumberFails(t *testing.T) {
 		}
 	}
 	for _, required := range []string{
-		"NOT $2::boolean",
-		"status IN ('pending','running')",
-		"purchased_count >= quantity",
-		"purchase_reserved_count=0",
-		"fulfilled_count=0",
-		"inflight_count=1",
-	} {
-		if !strings.Contains(allPurchasedActivationsFailedSQL, required) {
-			t.Fatalf("all-failed predicate missing %q: %s", required, allPurchasedActivationsFailedSQL)
-		}
-	}
-	for _, required := range []string{
-		"THEN 'failed' ELSE status END",
-		allPurchasedActivationsFailedReason,
-		"THEN COALESCE(finished_at, now()) ELSE finished_at END",
+		"$2::boolean AND status IN ('pending','running') AND fulfilled_count+1 >= quantity",
+		"THEN 'completed'",
+		"THEN ''",
+		"THEN COALESCE(finished_at, now())",
+		"AND inflight_count > 0",
 	} {
 		if !strings.Contains(releaseBatchSlotSQL, required) {
-			t.Fatalf("all-failed batch stop SQL missing %q: %s", required, releaseBatchSlotSQL)
+			t.Fatalf("success-target slot release SQL missing %q: %s", required, releaseBatchSlotSQL)
 		}
 	}
-	if strings.Contains(releaseBatchSlotSQL, "'completed'") {
-		t.Fatalf("an all-failed batch must be failed rather than completed: %s", releaseBatchSlotSQL)
+	for _, forbidden := range []string{"purchased_count >= quantity", "THEN 'failed'", allPurchasedActivationsFailedReason} {
+		if strings.Contains(releaseBatchSlotSQL, forbidden) {
+			t.Fatalf("failed activation must release its slot without stopping the batch (%q): %s", forbidden, releaseBatchSlotSQL)
+		}
 	}
 }
 

@@ -202,7 +202,10 @@ export const api = {
     }),
 
   getActivations: (batchId?: string) =>
-    request<unknown>(withQuery('/api/activations', { batch_id: batchId })),
+    request<unknown>(withQuery('/api/activations', {
+      batch_id: batchId,
+      limit: 500,
+    })),
 
   getAccountLoginStatuses: async (signal?: AbortSignal) =>
     validateAccountLoginStatusesPayload(await request<unknown>('/api/accounts/login-status', {

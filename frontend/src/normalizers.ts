@@ -466,20 +466,31 @@ export function normalizeActivation(payload: unknown): ActivationView {
   }
 }
 
-const pinnedActivationStatuses = new Set([
+const successfulActivationStatuses = new Set([
+  'pin_changed',
   'awaiting_subsequent_code',
   'polling',
   'active',
+  'success',
 ])
+
+export function isSuccessfulActivation(activation: ActivationView): boolean {
+  const status = activation.status.trim().toLowerCase().replace(/[\s-]+/g, '_')
+  const everFulfilled = asOptionalBoolean(pick(activation.raw, [
+    'ever_fulfilled',
+    'everFulfilled',
+  ]))
+  return everFulfilled === true || successfulActivationStatuses.has(status)
+}
 
 export function normalizeActivations(payload: unknown): ActivationView[] {
   const activations = entries(payload, ['activations', 'items', 'records'])
     .map(([, value]) => normalizeActivation(value))
     .filter((item) => item.id)
 
-  const awaitingSubsequent = activations.filter((item) => pinnedActivationStatuses.has(item.status))
-  const remaining = activations.filter((item) => !pinnedActivationStatuses.has(item.status))
-  return [...awaitingSubsequent, ...remaining]
+  const successful = activations.filter(isSuccessfulActivation)
+  const remaining = activations.filter((item) => !isSuccessfulActivation(item))
+  return [...successful, ...remaining]
 }
 
 function normalizeLoginState(value: unknown, valid?: boolean): GoPayLoginState {
@@ -553,6 +564,7 @@ const statusMap: Record<string, StatusMeta> = {
   purchasing: { label: '购买中', type: 'primary', active: true },
   purchased: { label: '校验号码', type: 'primary', active: true },
   duplicate: { label: '重复号码', type: 'warning', active: false },
+  phone_in_use: { label: '号码正在使用', type: 'warning', active: false },
   checking_login: { label: '校验号码', type: 'primary', active: true },
   awaiting_login_code: { label: '等待登录验证码', type: 'warning', active: true },
   login_code_timeout: { label: '登录验证码失败', type: 'danger', active: false },

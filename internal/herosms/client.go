@@ -117,8 +117,15 @@ func conclusivePurchaseHTTP(code string) bool {
 // that the remote activation was cancelled.
 func (c *Client) SetStatus(ctx context.Context, activationID string, status smsbower.SetStatus) (smsbower.SetStatusResult, error) {
 	result, err := c.Client.SetStatus(ctx, activationID, status)
-	if smsbower.IsAPIError(err, "HTTP_404") {
-		return result, &smsbower.APIError{Action: "setStatus", Code: "NO_ACTIVATION"}
+	var apiErr *smsbower.APIError
+	if !errors.As(err, &apiErr) {
+		return result, err
 	}
-	return result, err
+	labeledErr := *apiErr
+	labeledErr.Provider = "HeroSMS"
+	if strings.EqualFold(labeledErr.Code, "HTTP_404") {
+		labeledErr.Code = "NO_ACTIVATION"
+		labeledErr.Message = ""
+	}
+	return result, &labeledErr
 }

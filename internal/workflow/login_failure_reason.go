@@ -24,14 +24,53 @@ func activationStepFailureReason(activation domain.Activation, err error) string
 	// Classified provider actions are finalized on a later worker pass. A
 	// transient cancellation or completion error must not replace the durable
 	// classification already shown on the activation.
-	if (activation.Status == domain.ActivationStatusLoginFailed ||
-		activation.Status == domain.ActivationStatusPINSubmissionBlocked ||
-		activation.Status == domain.ActivationStatusLoginCodeTimeout ||
-		activation.Status == domain.ActivationStatusPINCodeTimeout) &&
+	if repairedReason, repair := repairedProviderFinalizationReason(activation); repair {
+		return boundActivationFailureReason(repairedReason)
+	}
+	if awaitingProviderFinalization(activation.Status) &&
 		strings.TrimSpace(activation.FailureReason) != "" {
 		return boundActivationFailureReason(activation.FailureReason)
 	}
 	return boundActivationFailureReason(err.Error())
+}
+
+func awaitingProviderFinalization(status domain.ActivationStatus) bool {
+	switch status {
+	case domain.ActivationStatusDuplicate,
+		domain.ActivationStatusPhoneInUse,
+		domain.ActivationStatusPINRequired,
+		domain.ActivationStatusUnregistered,
+		domain.ActivationStatusLoginFailed,
+		domain.ActivationStatusLoginCodeTimeout,
+		domain.ActivationStatusPINCodeTimeout,
+		domain.ActivationStatusZeroBalanceUsed,
+		domain.ActivationStatusPINSubmissionBlocked:
+		return true
+	default:
+		return false
+	}
+}
+
+func repairedProviderFinalizationReason(activation domain.Activation) (string, bool) {
+	// Older workers persisted the provider retry error over fixed business
+	// classifications which were still waiting for setStatus to succeed. Repair
+	// only that recognizable legacy shape; preserve every other stored detail.
+	legacyReason := strings.ToLower(strings.TrimSpace(activation.FailureReason))
+	if !strings.HasPrefix(legacyReason, "smsbower setstatus") {
+		return "", false
+	}
+	switch activation.Status {
+	case domain.ActivationStatusDuplicate:
+		return "historical phone number", true
+	case domain.ActivationStatusPINRequired:
+		return "账号需要已有 PIN 登录", true
+	case domain.ActivationStatusUnregistered:
+		return "未注册", true
+	case domain.ActivationStatusZeroBalanceUsed:
+		return "0RP已被使用", true
+	default:
+		return "", false
+	}
 }
 
 func pinSubmissionBlockedFailure(status domain.ActivationStatus, err error) bool {

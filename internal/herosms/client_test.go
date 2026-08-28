@@ -155,6 +155,16 @@ func TestHeroSetStatusMapsNotFoundToNoActivation(t *testing.T) {
 	if !smsbower.IsAPIError(err, "NO_ACTIVATION") {
 		t.Fatalf("error = %v, want NO_ACTIVATION", err)
 	}
+	if got := err.Error(); !strings.HasPrefix(got, "HeroSMS setStatus: NO_ACTIVATION") {
+		t.Fatalf("error text = %q, want HeroSMS prefix", got)
+	}
+	var apiErr *smsbower.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *smsbower.APIError", err)
+	}
+	if apiErr.Action != "setStatus" || apiErr.Raw != `{"message":"missing"}` {
+		t.Fatalf("API error = %#v, want original action and raw response", apiErr)
+	}
 }
 
 func TestHeroSetStatusPreservesConflictForRetry(t *testing.T) {
@@ -178,5 +188,15 @@ func TestHeroSetStatusPreservesConflictForRetry(t *testing.T) {
 	}
 	if smsbower.IsAPIError(err, "BAD_STATUS") {
 		t.Fatalf("error = %v, must not conclude BAD_STATUS", err)
+	}
+	if got := err.Error(); !strings.HasPrefix(got, "HeroSMS setStatus: HTTP_409") {
+		t.Fatalf("error text = %q, want HeroSMS prefix", got)
+	}
+	var apiErr *smsbower.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *smsbower.APIError", err)
+	}
+	if apiErr.Action != "setStatus" || !strings.Contains(apiErr.Raw, "EARLY_CANCEL_DENIED") {
+		t.Fatalf("API error = %#v, want original action and raw response", apiErr)
 	}
 }

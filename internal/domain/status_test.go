@@ -53,6 +53,7 @@ func TestTerminalStatuses(t *testing.T) {
 	}
 	for _, status := range []ActivationStatus{
 		ActivationStatusDuplicate,
+		ActivationStatusPhoneInUse,
 		ActivationStatusPINRequired,
 		ActivationStatusUnregistered,
 		ActivationStatusLoginFailed,
@@ -76,6 +77,15 @@ func TestPINSubmissionBlockedStatusIsDurableAndNonTerminal(t *testing.T) {
 	}
 	if ActivationStatusPINSubmissionBlocked.Terminal() {
 		t.Fatal("pin_submission_blocked must remain non-terminal until provider completion is finalized")
+	}
+}
+
+func TestPhoneInUseStatusIsValidAndNonTerminal(t *testing.T) {
+	if !ActivationStatusPhoneInUse.Valid() {
+		t.Fatal("phone_in_use must be a valid activation status")
+	}
+	if ActivationStatusPhoneInUse.Terminal() {
+		t.Fatal("phone_in_use must remain non-terminal until provider cancellation is finalized")
 	}
 }
 

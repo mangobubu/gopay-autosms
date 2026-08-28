@@ -241,6 +241,33 @@ func TestCreateBatchReturnsConflictWhenAnotherBatchIsActive(t *testing.T) {
 	}
 }
 
+func TestCreateBatchRejectsQuantityAboveDashboardLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	box, err := secure.New("create-batch-quantity-limit-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &createBatchConflictStore{}
+	settingsManager := appsettings.New(store, box, "http://sms.test")
+	manager := workflow.New(store, settingsManager, box, workflow.Config{}, nil)
+	router := NewRouter(store, settingsManager, manager, nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/batches", strings.NewReader(`{
+		"service":"go","country":"6","max_price":"1.25","quantity":101,"pin":"123456"
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("状态码 = %d，期望 %d；响应体：%s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+	if store.createCalls != 0 {
+		t.Fatalf("超量请求不应创建任务，CreateBatch 调用次数 = %d", store.createCalls)
+	}
+}
+
 type createBatchCaptureStore struct {
 	storage.Store
 	settings    map[string]domain.Setting

@@ -154,27 +154,86 @@ func TestBoundActivationFailureReasonRepairsInvalidUTF8(t *testing.T) {
 	}
 }
 
-func TestActivationStepFailureReasonPreservesLoginFailureDetail(t *testing.T) {
-	const original = "GoPay 登录失败（阶段：改 PIN 验证；HTTP 403；错误码：GoPay-112）"
-	activation := domain.Activation{
-		Status:        domain.ActivationStatusLoginFailed,
-		FailureReason: original,
-	}
+func TestActivationStepFailureReasonPreservesClassificationsAwaitingProviderFinalization(t *testing.T) {
+	for _, test := range []struct {
+		status domain.ActivationStatus
+		reason string
+	}{
+		{status: domain.ActivationStatusDuplicate, reason: "重复号码"},
+		{status: domain.ActivationStatusPhoneInUse, reason: "该号码当前仍有未结束任务"},
+		{status: domain.ActivationStatusPINRequired, reason: "账号需要已有 PIN 登录"},
+		{status: domain.ActivationStatusUnregistered, reason: "未注册"},
+		{status: domain.ActivationStatusLoginFailed, reason: "GoPay 登录失败（阶段：改 PIN 验证；HTTP 403；错误码：GoPay-112）"},
+		{status: domain.ActivationStatusLoginCodeTimeout, reason: "登录验证码重发 3 次后仍未收到"},
+		{status: domain.ActivationStatusPINCodeTimeout, reason: "改 PIN 验证码重发 3 次后仍未收到"},
+		{status: domain.ActivationStatusZeroBalanceUsed, reason: "0RP已被使用"},
+		{status: domain.ActivationStatusPINSubmissionBlocked, reason: "GoPay 操作失败（阶段：提交新 PIN；HTTP 403；错误码：GoPay-112）"},
+	} {
+		t.Run(string(test.status), func(t *testing.T) {
+			activation := domain.Activation{Status: test.status, FailureReason: test.reason}
+			providerErr := errors.New("smsbower setStatus: HTTP_409: Conflict")
 
-	if reason := activationStepFailureReason(activation, errors.New("SMSBower cancel temporarily failed")); reason != original {
-		t.Fatalf("reason=%q, want original detail %q", reason, original)
+			if reason := activationStepFailureReason(activation, providerErr); reason != test.reason {
+				t.Fatalf("reason=%q, want original classification %q", reason, test.reason)
+			}
+		})
 	}
 }
 
-func TestActivationStepFailureReasonPreservesPINSubmissionBlockedDetail(t *testing.T) {
-	const original = "GoPay 操作失败（阶段：提交新 PIN；HTTP 403；错误码：GoPay-112）"
-	activation := domain.Activation{
-		Status:        domain.ActivationStatusPINSubmissionBlocked,
-		FailureReason: original,
-	}
-
-	if reason := activationStepFailureReason(activation, errors.New("SMSBower complete temporarily failed")); reason != original {
-		t.Fatalf("reason=%q, want original detail %q", reason, original)
+func TestRepairedProviderFinalizationReasonRestoresOnlyFixedLegacyClassifications(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		activation domain.Activation
+		want       string
+		wantRepair bool
+	}{
+		{
+			name: "unregistered Hero conflict",
+			activation: domain.Activation{
+				Status: domain.ActivationStatusUnregistered, FailureReason: "smsbower setStatus: HTTP_409: Conflict",
+			},
+			want: "未注册", wantRepair: true,
+		},
+		{
+			name: "duplicate provider error",
+			activation: domain.Activation{
+				Status: domain.ActivationStatusDuplicate, FailureReason: "smsbower setStatus: HTTP_503: Service Unavailable",
+			},
+			want: "historical phone number", wantRepair: true,
+		},
+		{
+			name: "PIN required empty response",
+			activation: domain.Activation{
+				Status: domain.ActivationStatusPINRequired, FailureReason: "smsbower setStatus: EMPTY_RESPONSE",
+			},
+			want: "账号需要已有 PIN 登录", wantRepair: true,
+		},
+		{
+			name: "zero balance provider error",
+			activation: domain.Activation{
+				Status: domain.ActivationStatusZeroBalanceUsed, FailureReason: "smsbower setStatus request: temporary transport error",
+			},
+			want: "0RP已被使用", wantRepair: true,
+		},
+		{
+			name: "valid unregistered detail",
+			activation: domain.Activation{
+				Status: domain.ActivationStatusUnregistered, FailureReason: "未注册（人工复核）",
+			},
+		},
+		{
+			name: "variable login failure detail",
+			activation: domain.Activation{
+				Status: domain.ActivationStatusLoginFailed, FailureReason: "smsbower setStatus: HTTP_409: Conflict",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, repair := repairedProviderFinalizationReason(test.activation)
+			if got != test.want || repair != test.wantRepair {
+				t.Fatalf("repairedProviderFinalizationReason()=(%q, %v), want (%q, %v)", got, repair, test.want, test.wantRepair)
+			}
+		})
 	}
 }
 

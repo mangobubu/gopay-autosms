@@ -378,7 +378,7 @@ func TestLogin1FATimeoutRequestsAnotherSMSAndResendsGoPayOTP(t *testing.T) {
 	goPay := newVerificationResendGoPay(t, events)
 	defer goPay.Close()
 
-	oldSentAt := time.Now().UTC().Add(-verificationCodeWait - time.Second)
+	oldSentAt := time.Now().UTC().Add(-loginVerificationCodeWait - time.Second)
 	manager, store, box := newVerificationResendFlowManager(t, provider.URL, goPay.URL, gopay.Session{
 		Phone:            "81234567890",
 		CountryCode:      "+62",
@@ -440,7 +440,7 @@ func TestPINResetTimeoutRequestsAnotherSMSAndResendsGoPayOTP(t *testing.T) {
 	goPay := newVerificationResendGoPay(t, events)
 	defer goPay.Close()
 
-	oldSentAt := time.Now().UTC().Add(-verificationCodeWait - time.Second)
+	oldSentAt := time.Now().UTC().Add(-pinVerificationCodeWait - time.Second)
 	manager, store, box := newVerificationResendFlowManager(t, provider.URL, goPay.URL, gopay.Session{
 		Phone:             "81234567890",
 		CountryCode:       "+62",
@@ -501,6 +501,43 @@ func TestPINResetTimeoutRequestsAnotherSMSAndResendsGoPayOTP(t *testing.T) {
 	}
 }
 
+func TestPINCodeDoesNotResendBeforeEightySeconds(t *testing.T) {
+	events := &verificationResendEventLog{}
+	provider := newVerificationResendProvider(t, events)
+	defer provider.Close()
+	goPay := newVerificationResendGoPay(t, events)
+	defer goPay.Close()
+
+	manager, store, box := newVerificationResendFlowManager(t, provider.URL, goPay.URL, gopay.Session{
+		Phone:             "81234567890",
+		CountryCode:       "+62",
+		Device:            gopay.GenerateDeviceIdentity("81234567890"),
+		AccessToken:       "access-token",
+		PINVerificationID: "pin-verification-1",
+		PINOTPToken:       "pin-otp-token-1",
+		PINStage:          gopay.PINStageAwaiting,
+		PINCodeSentAt:     time.Now().UTC().Add(-61 * time.Second),
+	}, domain.ActivationStatusAwaitingPINCode)
+
+	if err := manager.pollPINCode(context.Background(), store.activationSnapshot()); err != nil {
+		t.Fatal(err)
+	}
+
+	state := store.session(t, box)
+	if state.PINStage != gopay.PINStageAwaiting || state.PINCodeResends != 0 {
+		t.Fatalf("PIN state before 80 seconds = stage %q count %d", state.PINStage, state.PINCodeResends)
+	}
+	store.mu.Lock()
+	advanceCalls := store.advanceCalls
+	store.mu.Unlock()
+	if advanceCalls != 0 {
+		t.Fatalf("provider resend calls before 80 seconds = %d, want 0", advanceCalls)
+	}
+	if got, want := events.snapshot(), []string{"provider:getStatus"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("events before 80 seconds = %v, want %v", got, want)
+	}
+}
+
 func TestLoginReady1FAConsumesLateCodeWithoutRequestingAnotherSMS(t *testing.T) {
 	events := &verificationResendEventLog{}
 	provider := newVerificationResendProvider(t, events, "STATUS_OK:7412")
@@ -516,7 +553,7 @@ func TestLoginReady1FAConsumesLateCodeWithoutRequestingAnotherSMS(t *testing.T) 
 		OTPToken:         "login-otp-token-1",
 		Methods:          []string{"otp_sms"},
 		LoginStage:       gopay.LoginStageReady1FA,
-		LoginCodeSentAt:  time.Now().UTC().Add(-verificationCodeWait - time.Second),
+		LoginCodeSentAt:  time.Now().UTC().Add(-loginVerificationCodeWait - time.Second),
 		LoginCodeResends: 2,
 	}, domain.ActivationStatusAwaitingLoginCode)
 
@@ -573,7 +610,7 @@ func TestPINResetReadyCycleConsumesLateCodeWithResetVerifierWithoutRequestingAno
 		PINChallengeID:    "challenge-1",
 		PINClientID:       "client-1",
 		PINStage:          gopay.PINStageResetReadyCycle,
-		PINCodeSentAt:     time.Now().UTC().Add(-verificationCodeWait - time.Second),
+		PINCodeSentAt:     time.Now().UTC().Add(-pinVerificationCodeWait - time.Second),
 		PINCodeResends:    2,
 	}, domain.ActivationStatusAwaitingPINCode)
 
@@ -636,7 +673,7 @@ func TestThirdVerificationCodeResendTimeoutCancelsAndClassifiesFailure(t *testin
 				VerificationID:   "login-verification-1",
 				Methods:          []string{"otp_sms"},
 				LoginStage:       gopay.LoginStageAwaiting1FAOTP,
-				LoginCodeSentAt:  time.Now().UTC().Add(-verificationCodeWait - time.Second),
+				LoginCodeSentAt:  time.Now().UTC().Add(-loginVerificationCodeWait - time.Second),
 				LoginCodeResends: verificationCodeResends,
 			},
 			poll: func(manager *Manager, ctx context.Context, activation domain.Activation) error {
@@ -654,7 +691,7 @@ func TestThirdVerificationCodeResendTimeoutCancelsAndClassifiesFailure(t *testin
 				Device:         gopay.GenerateDeviceIdentity("81234567890"),
 				AccessToken:    "access-token",
 				PINStage:       gopay.PINStageResetAwaiting,
-				PINCodeSentAt:  time.Now().UTC().Add(-verificationCodeWait - time.Second),
+				PINCodeSentAt:  time.Now().UTC().Add(-pinVerificationCodeWait - time.Second),
 				PINCodeResends: verificationCodeResends,
 			},
 			poll: func(manager *Manager, ctx context.Context, activation domain.Activation) error {

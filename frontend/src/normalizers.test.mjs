@@ -5,6 +5,7 @@ import {
   accountLoginStatus,
   activationStatus,
   batchStatus,
+  isSuccessfulActivation,
   normalizeAccountLoginStatuses,
   normalizeActivation,
   normalizeActivations,
@@ -77,6 +78,14 @@ test('maps a PIN code timeout to a terminal danger status', () => {
   })
 })
 
+test('distinguishes a currently active phone from historical blacklist behavior', () => {
+  assert.deepEqual(activationStatus('phone_in_use'), {
+    label: '号码正在使用',
+    type: 'warning',
+    active: false,
+  })
+})
+
 test('keeps activation errors available while PIN setup is being processed', () => {
   const activation = normalizeActivation({
     id: 'activation-1',
@@ -89,7 +98,7 @@ test('keeps activation errors available while PIN setup is being processed', () 
   assert.equal(activation.error, 'PIN 设置失败')
 })
 
-test('pins numbers waiting for subsequent codes while preserving the API order', () => {
+test('pins all successful numbers while preserving the API order', () => {
   const activations = normalizeActivations({
     activations: [
       { id: 'newest', status: 'logging_in' },
@@ -98,6 +107,8 @@ test('pins numbers waiting for subsequent codes while preserving the API order',
       { id: 'canonical-waiting', status: 'awaiting_subsequent_code' },
       { id: 'legacy-polling', status: 'polling' },
       { id: 'oldest', status: 'success' },
+      { id: 'historical-success', status: 'failed', ever_fulfilled: true },
+      { id: 'still-working', status: 'purchasing', ever_fulfilled: false },
     ],
   })
 
@@ -105,12 +116,18 @@ test('pins numbers waiting for subsequent codes while preserving the API order',
     activations.map(({ id }) => id),
     [
       'legacy-active',
+      'pin-changed',
       'canonical-waiting',
       'legacy-polling',
-      'newest',
-      'pin-changed',
       'oldest',
+      'historical-success',
+      'newest',
+      'still-working',
     ],
+  )
+  assert.deepEqual(
+    activations.map(isSuccessfulActivation),
+    [true, true, true, true, true, true, false, false],
   )
 })
 

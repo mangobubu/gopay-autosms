@@ -48,6 +48,28 @@ test('lists batches through the batch collection endpoint', async (t) => {
   assert.deepEqual(result, { batches: [{ id: 'batch-7', status: 'running' }] })
 })
 
+test('requests the full activation dashboard page for a batch', async (t) => {
+  const originalFetch = globalThis.fetch
+  t.after(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  let request
+  globalThis.fetch = async (input, init) => {
+    request = { input, init }
+    return new Response(JSON.stringify({ activations: [] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+
+  const result = await api.getActivations('batch/42')
+
+  assert.equal(request.input, '/api/activations?batch_id=batch%2F42&limit=500')
+  assert.equal(request.init.credentials, 'same-origin')
+  assert.deepEqual(result, { activations: [] })
+})
+
 test('routes settings and catalog requests through the selected SMS provider', async (t) => {
   const originalFetch = globalThis.fetch
   t.after(() => {

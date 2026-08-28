@@ -17,6 +17,7 @@ import (
 	"github.com/mangobubu/gopay-autosms/internal/domain"
 	"github.com/mangobubu/gopay-autosms/internal/secure"
 	appsettings "github.com/mangobubu/gopay-autosms/internal/settings"
+	"github.com/mangobubu/gopay-autosms/internal/smsprovider"
 	"github.com/mangobubu/gopay-autosms/internal/storage"
 )
 
@@ -37,6 +38,10 @@ type loginFailureStore struct {
 }
 
 func loginFailureSMSSetting(t *testing.T, box *secure.Box) domain.Setting {
+	return loginFailureSMSProviderSetting(t, box, appsettings.SMSBowerKey)
+}
+
+func loginFailureSMSProviderSetting(t *testing.T, box *secure.Box, key string) domain.Setting {
 	t.Helper()
 	apiKeyCiphertext, err := box.Seal([]byte("fixture-api-key"))
 	if err != nil {
@@ -48,7 +53,7 @@ func loginFailureSMSSetting(t *testing.T, box *secure.Box) domain.Setting {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return domain.Setting{Key: appsettings.SMSBowerKey, Value: settingValue}
+	return domain.Setting{Key: key, Value: settingValue}
 }
 
 func (s *loginFailureStore) ReleaseActivationLease(context.Context, int64, string, time.Time) error {
@@ -262,5 +267,137 @@ func TestProcessActivationPreservesLoginFailureDetailAcrossProviderRetry(t *test
 	}
 	if releases != 1 {
 		t.Fatalf("lease releases=%d, want 1 after the failed provider attempt", releases)
+	}
+}
+
+func TestProcessActivationPreservesUnregisteredReasonAcrossHeroConflictRetry(t *testing.T) {
+	var smsBowerCalls int
+	smsBowerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		smsBowerCalls++
+		_, _ = io.WriteString(w, "ACCESS_CANCEL")
+	}))
+	defer smsBowerServer.Close()
+
+	var heroCalls int
+	heroServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("action") != "setStatus" ||
+			r.URL.Query().Get("status") != "8" ||
+			r.URL.Query().Get("id") != "hero-activation-retry" {
+			http.Error(w, "unexpected HeroSMS request", http.StatusBadRequest)
+			return
+		}
+		heroCalls++
+		if heroCalls == 1 {
+			http.Error(w, "early cancellation conflict", http.StatusConflict)
+			return
+		}
+		_, _ = io.WriteString(w, "ACCESS_CANCEL")
+	}))
+	defer heroServer.Close()
+
+	box, err := secure.New("unregistered-hero-provider-retry-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &loginFailureStore{
+		setting: loginFailureSMSProviderSetting(t, box, appsettings.HeroSMSKey),
+	}
+	manager := New(
+		store,
+		appsettings.New(store, box, smsBowerServer.URL, heroServer.URL),
+		box,
+		Config{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	activation := domain.Activation{
+		ID: 41, Provider: smsprovider.HeroSMS, ProviderActivationID: "hero-activation-retry",
+		PhoneNumber: "+6281234567890", Status: domain.ActivationStatusUnregistered,
+		FailureReason: "未注册", LeaseOwner: "worker-hero-retry", LeaseVersion: 7,
+	}
+
+	manager.processActivation(context.Background(), activation)
+	manager.processActivation(context.Background(), activation)
+
+	store.mu.Lock()
+	transitions := append([]loginFailureTransition(nil), store.transitions...)
+	finalizations := append([][]domain.ActivationStatus(nil), store.finalizations...)
+	releases := store.releases
+	store.mu.Unlock()
+	if smsBowerCalls != 0 {
+		t.Fatalf("SMSBower calls=%d, want 0 for hero-sms activation", smsBowerCalls)
+	}
+	if heroCalls != 2 {
+		t.Fatalf("HeroSMS cancel calls=%d, want 2", heroCalls)
+	}
+	wantTransitions := []loginFailureTransition{{
+		next: domain.ActivationStatusUnregistered, reason: "未注册",
+	}}
+	if !reflect.DeepEqual(transitions, wantTransitions) {
+		t.Fatalf("transitions=%+v, want preserved classification %+v", transitions, wantTransitions)
+	}
+	wantFinalizations := [][]domain.ActivationStatus{{domain.ActivationStatusUnregistered}}
+	if !reflect.DeepEqual(finalizations, wantFinalizations) {
+		t.Fatalf("finalizations=%v, want %v", finalizations, wantFinalizations)
+	}
+	if releases != 1 {
+		t.Fatalf("lease releases=%d, want 1 after the HTTP 409 attempt", releases)
+	}
+}
+
+func TestProcessActivationRepairsLegacyUnregisteredHeroConflictBeforeSuccessfulRetry(t *testing.T) {
+	var heroCalls int
+	heroServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("action") != "setStatus" || r.URL.Query().Get("status") != "8" {
+			http.Error(w, "unexpected HeroSMS request", http.StatusBadRequest)
+			return
+		}
+		heroCalls++
+		_, _ = io.WriteString(w, "ACCESS_CANCEL")
+	}))
+	defer heroServer.Close()
+
+	box, err := secure.New("legacy-unregistered-hero-retry-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &loginFailureStore{
+		setting: loginFailureSMSProviderSetting(t, box, appsettings.HeroSMSKey),
+	}
+	manager := New(
+		store,
+		appsettings.New(store, box, "https://smsbower.invalid", heroServer.URL),
+		box,
+		Config{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	activation := domain.Activation{
+		ID: 42, Provider: smsprovider.HeroSMS, ProviderActivationID: "legacy-hero-activation",
+		PhoneNumber: "+6281234567890", Status: domain.ActivationStatusUnregistered,
+		FailureReason: "smsbower setStatus: HTTP_409: Conflict",
+		LeaseOwner:    "worker-legacy-hero-retry", LeaseVersion: 8,
+	}
+
+	manager.processActivation(context.Background(), activation)
+
+	store.mu.Lock()
+	transitions := append([]loginFailureTransition(nil), store.transitions...)
+	finalizations := append([][]domain.ActivationStatus(nil), store.finalizations...)
+	releases := store.releases
+	store.mu.Unlock()
+	if heroCalls != 1 {
+		t.Fatalf("HeroSMS cancel calls=%d, want 1", heroCalls)
+	}
+	wantTransitions := []loginFailureTransition{{
+		next: domain.ActivationStatusUnregistered, reason: "未注册",
+	}}
+	if !reflect.DeepEqual(transitions, wantTransitions) {
+		t.Fatalf("transitions=%+v, want legacy reason repair %+v", transitions, wantTransitions)
+	}
+	wantFinalizations := [][]domain.ActivationStatus{{domain.ActivationStatusUnregistered}}
+	if !reflect.DeepEqual(finalizations, wantFinalizations) {
+		t.Fatalf("finalizations=%v, want %v", finalizations, wantFinalizations)
+	}
+	if releases != 0 {
+		t.Fatalf("lease releases=%d, want 0 after successful finalization", releases)
 	}
 }
